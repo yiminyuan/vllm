@@ -16,7 +16,12 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 class ExllamaLinearKernel(MPLinearKernel):
-    SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
+    SUPPORTED_QUANT_TYPES = [
+        scalar_types.uint4b8,
+        scalar_types.uint8b128,
+        scalar_types.uint4,
+        scalar_types.uint8,
+    ]
     # In theory supports `scalar_types.uint2b2, scalar_types.uint3b4` too but
     # currently untested so not added to the list
 
@@ -78,11 +83,11 @@ class ExllamaLinearKernel(MPLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         c = self.config
+        device = getattr(layer, self.w_q_name).device
 
         # For Exllama, we need to set a zero-point tensor if there is not one
         if not c.zero_points:
             self.w_zp_name = "qzeros"
-            device = getattr(layer, self.w_q_name).device
             groups = c.partition_weight_shape[0] // c.group_size
             out_features = c.partition_weight_shape[1]
 
@@ -142,6 +147,16 @@ class ExllamaLinearKernel(MPLinearKernel):
             x.data = x.data.contiguous()
             return x.to(dtype=c.act_type)
 
+        # compressed-tensors ships zeros as [N//pack, K//G]; gptq_gemm wants the
+        # transpose [K//G, N//pack].
+        if c.zero_points:
+
+            def transform_w_zp(x):
+                x.data = x.data.t().contiguous()
+                return x
+
+            self._transform_param(layer, self.w_zp_name, transform_w_zp)
+
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
@@ -159,10 +174,10 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
 
-        # gptq_gemm supports GPTQv2 format by passing use_v2_format=True.
-        # However, the MPLinearLayerConfig doesn't contain format info.
-        # So hardcode GPTQv1 format here, to keep its behavior unchanged.
-        use_v2_format = False
+        # Asymmetric compressed-tensors stores true zero points (GPTQv2). Symmetric
+        # GPTQ uses biased zeros (v1) and is the only other path here, since auto_gptq
+        # always sets zero_points=False.
+        use_v2_format = c.zero_points
 
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
