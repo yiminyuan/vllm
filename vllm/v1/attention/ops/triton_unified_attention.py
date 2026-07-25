@@ -1081,6 +1081,13 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    # Force num_stages=1 on ROCm: num_stages=2 needs ~136 KB LDS for this
+    # fused-attention kernel, over RDNA2's (gfx1030) 64 KB. Unconditional because
+    # the B200 tuned_large_head block above also sets 2, and its
+    # is_device_capability_family(100) gate false-matches gfx10 (cap major 10).
+    # num_stages=1 is also AMD's recommended value for FA kernels.
+    if current_platform.is_rocm():
+        launch_num_stages = 1
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
         launch_kwargs["num_warps"] = launch_num_warps
