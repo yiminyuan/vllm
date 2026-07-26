@@ -1356,6 +1356,13 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/attention.cu")
 
+  set(VLLM_ROCM_HAS_GFX1030 OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1030")
+    set(VLLM_ROCM_HAS_GFX1030 ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/q_gemm_rdna2.cu")
+  endif()
+
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
     set(VLLM_ROCM_HAS_GFX1100 ON)
@@ -1374,6 +1381,10 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     ARCHITECTURES ${VLLM_GPU_ARCHES}
     USE_SABI 3
     WITH_SOABI)
+
+  if(VLLM_ROCM_HAS_GFX1030)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1030)
+  endif()
 
   if(VLLM_ROCM_HAS_GFX1100)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1100)
