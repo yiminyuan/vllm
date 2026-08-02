@@ -218,6 +218,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        elif current_platform.is_rocm():
+            from vllm.model_executor.layers.utils import maybe_pad_rdna2_gemv_weight
+
+            maybe_pad_rdna2_gemv_weight(layer)
 
     def apply(
         self,

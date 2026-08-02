@@ -119,16 +119,90 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+# Elements of padding added to each weight row on gfx1030. Must stay a multiple
+# of 8: the skinny GEMV reads each row as 16-byte float4 chunks, so a row start
+# has to remain 16-byte aligned, and 8 fp16/bf16 elements are exactly 16 bytes.
+GFX1030_GEMV_ROW_PAD = 8
+
+
+def maybe_pad_rdna2_gemv_weight(layer: torch.nn.Module) -> None:
+    """Break a power-of-two row stride on weights the RDNA2 skinny GEMV reads.
+
+    A contiguous ``[out, in]`` weight has a row stride of ``in * itemsize``
+    bytes, which is a power of two for every shape this model uses. The GEMV
+    gives one wavefront to each output row and runs eight of them per
+    workgroup, so eight rows are read at once -- and with a power-of-two stride
+    they all land on the same memory channels. Padding the stride spreads them.
+
+    Measured on the DeepSeek-V4 decode shapes: 1.1-1.8x, e.g. [4096, 2048] goes
+    197 -> 331 GB/s and [2048, 4096] 182 -> 326 GB/s. The result is unchanged
+    bit for bit -- the same K values are read, in the same order, and only the
+    distance between rows differs. The kernel already takes the row stride from
+    the tensor, so nothing about it changes.
+    """
+    from vllm.model_executor.utils import replace_parameter
+    from vllm.platforms.rocm import on_gfx1030
+
+    if not (envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx1030()):
+        return
+    weight = getattr(layer, "weight", None)
+    if weight is None or weight.dim() != 2 or not weight.is_contiguous():
+        return
+    if weight.dtype not in (torch.float16, torch.bfloat16):
+        return
+    out_size, in_size = weight.shape
+    if in_size % 8 != 0:  # the kernel declines these anyway
+        return
+    row_bytes = in_size * weight.element_size()
+    if row_bytes & (row_bytes - 1):  # already not a power of two
+        return
+
+    padded = torch.empty(
+        (out_size, in_size + GFX1030_GEMV_ROW_PAD),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    padded[:, :in_size] = weight
+    replace_parameter(layer, "weight", padded[:, :in_size])
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        GFX1030_SKINNY_GEMV_MAX_TOKENS,
+        on_gfx1x,
+        on_gfx9,
+        on_gfx950,
+        on_gfx1030,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
     cu_count = num_compute_units()
+
+    # RDNA2 (gfx1030): the skinny GEMV (e.g. the large-vocab lm_head, or the
+    # MTP fusion fc which is bf16) is a ~5x win over the rocBLAS fallback, which
+    # sits at ~20% of GDDR6 bandwidth here. fp16/bf16 only; bf16 is upconverted
+    # to fp16 in the kernel. wvSplitK proper is gfx9/gfx11 only, so gfx1030 uses
+    # its own kernel (which stages A in LDS or streams it for large K). The
+    # rocBLAS cost is flat from 1 to 32 tokens because it is entirely
+    # weight-bound, so every token the kernel can take is one that would
+    # otherwise pay a full weight stream for nothing.
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1030()
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == x.dtype
+        and k % 8 == 0
+        and 0 < n <= GFX1030_SKINNY_GEMV_MAX_TOKENS
+    ):
+        x_view = x.reshape(-1, x.size(-1))
+        out = ops.wvSplitK_rdna2(weight, x_view, bias)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
 
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()
