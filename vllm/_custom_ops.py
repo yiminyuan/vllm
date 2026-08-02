@@ -2110,6 +2110,12 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def wvSplitK_rdna2(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor = None
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_rdna2(a, b, bias)
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

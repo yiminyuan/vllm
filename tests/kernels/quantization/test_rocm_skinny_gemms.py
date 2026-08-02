@@ -8,7 +8,7 @@ import torch
 import vllm._custom_ops as ops
 from tests.kernels.quant_utils import ref_dynamic_per_tensor_fp8_quant
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx950
+from vllm.platforms.rocm import on_gfx950, on_gfx1030
 from vllm.utils.platform_utils import num_compute_units
 
 DTYPES = [torch.bfloat16, torch.float16]
@@ -227,6 +227,58 @@ def test_rocm_wvsplitk_kernel(
     out = ops.wvSplitK(B, A.view(-1, A.size(-1)), cu_count, BIAS)
 
     # Accumulation error in fp16 GEMM scales with sqrt(K)
+    atol = torch.finfo(dtype).eps * math.sqrt(k)
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+
+
+# (n, k, m) for the RDNA2 fp16 skinny GEMV: n<=5, k%8==0. Covers the large-vocab
+# lm_head (the motivating case), both dispatch paths -- A staged in LDS when it
+# fits (n*k*2 <= 64 KB) and A streamed from global for large K -- and edge cases
+# (k not a multiple of the 256-elem step, odd m -> grid-stride remainder).
+NKM_FACTORS_WVSPLITK_RDNA2 = [
+    (1, 5120, 8192),
+    (1, 5120, 124160),  # lm_head per die (vocab 248320, TP-2)
+    (1, 4096, 17408),
+    (2, 4096, 8192),
+    (3, 2048, 4096),
+    (4, 4096, 4096),
+    (5, 2048, 8192),
+    (1, 4104, 1024),  # k % 256 != 0
+    (1, 4096, 4097),  # m not a multiple of the wave tile
+    # Large K: A does not fit LDS -> streamed-from-global path.
+    (1, 40960, 8192),
+    (3, 20480, 4096),
+    (4, 16384, 8192),
+    (5, 16384, 4096),
+]
+
+
+@pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_RDNA2)
+@pytest.mark.parametrize("bias_mode", BIAS_MODES)
+@pytest.mark.parametrize("padded_b", [False, True])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) skinny GEMV")
+def test_rocm_wvsplitk_rdna2_kernel(n, k, m, bias_mode, padded_b, dtype, seed):
+    torch.manual_seed(seed)
+    # fp16 and bf16 both accepted; bf16 is upconverted to fp16 in the kernel.
+
+    xavier = math.sqrt(2 / k)  # normalize to keep fp16 accumulation well-scaled
+    A = (torch.rand(n, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    B = (torch.rand(m, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    if padded_b:
+        B = pad_fp8(B)  # non-contiguous row stride
+
+    BIAS = None
+    if bias_mode == 1:
+        BIAS = torch.rand(m, dtype=dtype, device="cuda") * 2 - 1
+    elif bias_mode == 2:
+        BIAS = torch.rand(n, m, dtype=dtype, device="cuda") * 2 - 1
+
+    ref_out = torch.nn.functional.linear(A, B, BIAS)
+    out = ops.wvSplitK_rdna2(B, A.view(-1, A.size(-1)), BIAS)
+
     atol = torch.finfo(dtype).eps * math.sqrt(k)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
 

@@ -122,13 +122,31 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950
+    from vllm.platforms.rocm import on_gfx1030, on_gfx1x, on_gfx9, on_gfx950
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
     cu_count = num_compute_units()
+
+    # RDNA2 (gfx1030): the skinny GEMV (e.g. the large-vocab lm_head, or the
+    # MTP fusion fc which is bf16) is a ~5x win over the rocBLAS fallback, which
+    # sits at ~20% of GDDR6 bandwidth here. fp16/bf16 and N<=5 only; bf16 is
+    # upconverted to fp16 in the kernel. wvSplitK proper is gfx9/gfx11 only, so
+    # gfx1030 uses its own kernel (which stages A in LDS or streams it for large
+    # K).
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1030()
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == x.dtype
+        and k % 8 == 0
+        and 0 < n <= 5
+    ):
+        x_view = x.reshape(-1, x.size(-1))
+        out = ops.wvSplitK_rdna2(weight, x_view, bias)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
 
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()

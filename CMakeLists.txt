@@ -1371,7 +1371,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   if(VLLM_GPU_ARCHES MATCHES "gfx1030")
     set(VLLM_ROCM_HAS_GFX1030 ON)
     list(APPEND VLLM_ROCM_EXT_SRC
-      "csrc/rocm/q_gemm_rdna2.cu")
+      "csrc/rocm/q_gemm_rdna2.cu"
+      "csrc/rocm/skinny_gemms_rdna2.cu")
   endif()
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)

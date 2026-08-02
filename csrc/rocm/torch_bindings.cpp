@@ -53,6 +53,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gptq_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
       "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna2", torch::kCUDA, &gptq_gemm_rdna2);
+
+  // fp16 skinny GEMV (N<=5) for AMD RDNA2 (gfx1030) -- the RDNA2-native
+  // replacement for wvSplitK, which is gfx9/gfx11 only.
+  rocm_ops.def(
+      "wvSplitK_rdna2(Tensor in_a, Tensor in_b, Tensor? in_bias) -> Tensor");
+  rocm_ops.impl("wvSplitK_rdna2", torch::kCUDA, &wvSplitK_rdna2);
 #endif
 
 #ifdef VLLM_ROCM_GFX1100
