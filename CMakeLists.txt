@@ -1529,6 +1529,13 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
+  set(VLLM_ROCM_HAS_GFX1030 OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1030")
+    set(VLLM_ROCM_HAS_GFX1030 ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/q_gemm_rdna2.cu")
+  endif()
+
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
     set(VLLM_ROCM_HAS_GFX1100 ON)
@@ -1552,6 +1559,10 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_link_libraries(_rocm_C PRIVATE _rocm_C_skinny)
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
+  endif()
+
+  if(VLLM_ROCM_HAS_GFX1030)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1030)
   endif()
 
   if(VLLM_ROCM_HAS_GFX1100)
