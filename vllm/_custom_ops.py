@@ -2214,6 +2214,28 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def wvSplitK_rdna2(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor = None,
+    out_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_rdna2(a, b, bias, out_dtype, out)
+
+
+def wvSplitK_rdna2_grouped(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Batched skinny GEMV: contract ``b [N, G, K]`` with ``a [G, M, K]``.
+
+    Returns ``[N, G, M]``. One launch covers every group, where calling
+    :func:`wvSplitK_rdna2` per group pays the GPU's kernel-to-kernel dispatch
+    latency once per group.
+    """
+    return torch.ops._rocm_C.wvSplitK_rdna2_grouped(a, b, out)
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

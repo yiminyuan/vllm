@@ -232,6 +232,11 @@ _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 _ON_RDNA = _ON_GFX1X and not _ON_CDNA
 _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
 
+# Largest token count wvSplitK_rdna2 is instantiated for; above it the kernel
+# raises and callers must fall back. Mirrors MAX_N in
+# csrc/rocm/skinny_gemms_rdna2.cu -- keep the two in step.
+GFX1030_SKINNY_GEMV_MAX_TOKENS = 16
+
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
     """
