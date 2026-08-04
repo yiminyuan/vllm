@@ -147,11 +147,20 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if world_size > 2 and not fully_connected:
+        # gfx1030 needs XGMI (coherent cross-die atomics) even at world_size 2 --
+        # a W6800X Duo without the IFL jumper, or consumer cards over PCIe, must
+        # fall back to PYNCCL. CUDA only needs full NVLink for >2 GPUs.
+        is_gfx1030 = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1030
+
+            is_gfx1030 = on_gfx1030()
+        requires_full_connectivity = world_size > 2 or is_gfx1030
+        if requires_full_connectivity and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+                " PCIe-only GPUs (no full NVLink/XGMI connectivity). To silence"
+                " this warning, specify disable_custom_all_reduce=True explicitly."
             )
             return
         # test P2P capability, this checks software/cudaruntime support
@@ -167,6 +176,10 @@ class CustomAllreduce:
             return
 
         self.disabled = False
+        # gfx1030 can't IPC-export raw graph-captured activation buffers into
+        # coherent cross-die peer pointers, so route captured all-reduces
+        # through the pre-registered fixed buffer (copy path) instead.
+        self.use_graph_buffers = not is_gfx1030
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
@@ -268,7 +281,7 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                return self.all_reduce(input, registered=self.use_graph_buffers)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.

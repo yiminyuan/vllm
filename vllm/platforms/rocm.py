@@ -903,8 +903,9 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        # MI300 series; and RDNA2 (gfx1030), where is_fully_connected() gates it
+        # to XGMI-linked GPUs (the coherent cross-die atomics the kernel needs).
+        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]) or _ON_GFX1030
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
