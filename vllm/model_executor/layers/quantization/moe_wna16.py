@@ -180,6 +180,21 @@ class MoeWNA16Config(QuantizationConfig):
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, RoutedExperts):
+            from vllm.platforms import current_platform
+
+            if current_platform.is_rocm() and self.weight_bits == 4:
+                from vllm.platforms.rocm import on_gfx1030
+
+                if (
+                    on_gfx1030()
+                    and hasattr(torch.ops, "_rocm_C")
+                    and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna2")
+                ):
+                    from vllm.model_executor.layers.quantization.moe_wna16_rdna2 import (  # noqa: E501
+                        MoeWNA16RDNA2Method,
+                    )
+
+                    return MoeWNA16RDNA2Method(self, layer.moe_config)
             return MoeWNA16Method(self, layer.moe_config)
         return None
 

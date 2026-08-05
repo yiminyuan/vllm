@@ -54,6 +54,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna2", torch::kCUDA, &gptq_gemm_rdna2);
 
+  // W4A16 MoE kernel for AMD RDNA2 (gfx1030), fp16-only. Accumulates into the
+  // caller-zeroed `output`.
+  rocm_ops.def(
+      "moe_gptq_gemm_rdna2(Tensor input, Tensor! output, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor b_qzeros, Tensor topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, int top_k, int block_size_m, "
+      "bool mul_weights, bool use_v2_format, int output_topk) -> ()");
+  rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
+
   // fp16 skinny GEMV (N<=5) for AMD RDNA2 (gfx1030) -- the RDNA2-native
   // replacement for wvSplitK, which is gfx9/gfx11 only.
   rocm_ops.def(

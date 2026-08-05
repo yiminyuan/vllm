@@ -28,6 +28,13 @@ torch::Tensor gptq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);
 
+void moe_gptq_gemm_rdna2(
+    torch::Tensor input, torch::Tensor output, torch::Tensor b_q_weight,
+    torch::Tensor b_scales, torch::Tensor b_qzeros, torch::Tensor topk_weights,
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_padded, int64_t top_k, int64_t block_size_m,
+    bool mul_weights, bool use_v2_format, int64_t output_topk);
+
 torch::Tensor wvSplitK_rdna2(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::Tensor>& in_bias);
 
