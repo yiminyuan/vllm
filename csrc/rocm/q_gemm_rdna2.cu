@@ -34,11 +34,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#include "qdq_4_rdna2.cuh"
-
-#if defined(__HIPCC__) && defined(__gfx1030__)
-  #define __HIP__RDNA2__
-#endif
+#include "q_gemm_rdna2_common.cuh"
 
 namespace vllm {
 namespace gptq_rdna2 {
@@ -57,94 +53,6 @@ namespace gptq_rdna2 {
 // ---------------------------------------------------------------------------
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
-
-__forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
-  // RDNA2 has v_dot2_f32_f16 (__builtin_amdgcn_fdot2): fp32 += a.x*b.x + a.y*b.y
-  // in one instruction with the accumulator held in fp32 throughout. hipcc does
-  // not peephole __hfma2 + cast + add into it, so we issue the builtin.
-  float result = 0.0f;
-  const half2* a2_ptr = (const half2*)a_ptr;
-  #pragma unroll
-  for (int i = 0; i < 4; i++) {
-    result = __builtin_amdgcn_fdot2(dq[i], *a2_ptr++, result, /*clamp=*/false);
-  }
-  return result;
-}
-
-// Packed atomic-add via CAS-loop on a 64-bit word (2 fp32 lanes per CAS).
-// RDNA2 has no float-add atomic of any width: the ISA's only float atomics are
-// FCMPSWAP, FMIN and FMAX, so any float accumulation lowers to
-// global_atomic_cmpswap_x2 + retry. Two fp32 lanes is the widest that CAS
-// carries, which halves the retry traffic against one CAS per float.
-//
-// The accumulator is fp32 rather than the output's fp16 because the caller sums
-// gridDim.z K-splits here. Rounding each partial to fp16 cost ~0.5% at K=7168,
-// an order of magnitude worse than an fp16 sum of the same terms, and made the
-// result depend on the order the splits happened to land in.
-__forceinline__ __device__ void atomic_add_pk2_f32(float* addr, float v0,
-                                                   float v1) {
-  unsigned long long* addr_u = reinterpret_cast<unsigned long long*>(addr);
-  unsigned long long old = *addr_u;
-  while (true) {
-    union {
-      unsigned long long u;
-      float f[2];
-    } cur, sum;
-    cur.u = old;
-    sum.f[0] = cur.f[0] + v0;
-    sum.f[1] = cur.f[1] + v1;
-    unsigned long long prev = atomicCAS(addr_u, old, sum.u);
-    if (prev == old) break;
-    old = prev;
-  }
-}
-
-// Load 4 packed zeros (column n..n+3) from a [groups, N/8] uint32 tensor. n is a
-// multiple of 4 by construction, so the 4 nibbles live within one uint32 word.
-__forceinline__ __device__ void load4_zeros(const uint32_t* qzeros_row, int n,
-                                            int (&zeros)[4]) {
-  int qcol = n / 8;
-  int shift = (n & 0x07) * 4;
-  uint32_t d = qzeros_row[qcol] >> shift;
-  zeros[0] = (int)(d & 0xF);
-  zeros[1] = (int)((d >> 4) & 0xF);
-  zeros[2] = (int)((d >> 8) & 0xF);
-  zeros[3] = (int)((d >> 12) & 0xF);
-}
-
-__forceinline__ __device__ void load4_scales(const half* scales_row, int n,
-                                             half (&scales)[4]) {
-  scales[0] = scales_row[n + 0];
-  scales[1] = scales_row[n + 1];
-  scales[2] = scales_row[n + 2];
-  scales[3] = scales_row[n + 3];
-}
-
-// Sum the per-split slices in split order and round once to the output dtype.
-// Four columns per thread so both the loads and the store stay vector-width.
-__global__ void reduce_splits_kernel_rdna2(const float* __restrict__ partials,
-                                           half* __restrict__ c,
-                                           const int num_splits,
-                                           const long mn) {
-  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx * 4 >= mn) return;
-  float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-  for (int z = 0; z < num_splits; ++z) {
-    const float4 v =
-        reinterpret_cast<const float4*>(partials + (long)z * mn)[idx];
-    acc.x += v.x;
-    acc.y += v.y;
-    acc.z += v.z;
-    acc.w += v.w;
-  }
-  union {
-    unsigned long long u;
-    half2 h[2];
-  } out;
-  out.h[0] = __halves2half2(__float2half_rn(acc.x), __float2half_rn(acc.y));
-  out.h[1] = __halves2half2(__float2half_rn(acc.z), __float2half_rn(acc.w));
-  reinterpret_cast<unsigned long long*>(c)[idx] = out.u;
-}
 
 template <int M_COUNT, int BLOCK_KN_SIZE>
 __global__ void gemm_q4_kernel_rdna2(
@@ -431,7 +339,7 @@ void launch_gemm_q4(const half* a, const uint32_t* b_q_weight,
     const long mn = (long)rows * size_n;
     const long vec = mn / 4;  // 4 columns per thread; size_n % 8 == 0
     const int red_blocks = (int)((vec + RED_THREADS - 1) / RED_THREADS);
-    reduce_splits_kernel_rdna2<<<red_blocks, RED_THREADS, 0, stream>>>(
+    reduce_splits_kernel_rdna2<0><<<red_blocks, RED_THREADS, 0, stream>>>(
         two_phase ? partials : acc_pass, out_pass, two_phase ? num_splits : 1,
         mn);
   }
