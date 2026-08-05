@@ -204,10 +204,14 @@ class RoutedExperts(PluggableLayer):
 
     # TODO(bnell): make this a method on quant_method
     def _needs_intermediate_size_param(self, quant_method: FusedMoEMethodBase) -> bool:
-        return quant_method.__class__.__name__ in (
-            "AutoGPTQMoEMethod",
-            "CompressedTensorsWNA16MoEMethod",
-            "CompressedTensorsW4A16FlydslMoEMethod",
+        # Matched over the MRO so the per-arch subclasses (RDNA2/RDNA3) inherit
+        # the requirement along with the create_weights that reads it.
+        return not {cls.__name__ for cls in type(quant_method).__mro__}.isdisjoint(
+            (
+                "AutoGPTQMoEMethod",
+                "CompressedTensorsWNA16MoEMethod",
+                "CompressedTensorsW4A16FlydslMoEMethod",
+            )
         )
 
     def _ensure_moe_quant_config_init(self):
@@ -636,6 +640,7 @@ class RoutedExperts(PluggableLayer):
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
+        quant_method_mro = {cls.__name__ for cls in type(self.quant_method).__mro__}
         global_expert_id = expert_id
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
@@ -657,10 +662,11 @@ class RoutedExperts(PluggableLayer):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        if quant_method_name in (
-            "CompressedTensorsWNA16MoEMethod",
-            "CompressedTensorsWNA16RDNA3MoEMethod",
-            "CompressedTensorsW4A16FlydslMoEMethod",
+        if not quant_method_mro.isdisjoint(
+            (
+                "CompressedTensorsWNA16MoEMethod",
+                "CompressedTensorsW4A16FlydslMoEMethod",
+            )
         ):
             if is_transposed:
                 loaded_weight = loaded_weight.t().contiguous()
