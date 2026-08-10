@@ -1,9 +1,101 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+
 import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.triton_utils import tl, triton
+
+
+@functools.cache
+def use_fp8_bitops_decode() -> bool:
+    """Whether to decode FP8 with native integer ops instead of a convert.
+
+    RDNA2 has no FP8 convert instruction, so ``.to(tl.float8e4nv)`` lowers to a
+    v_cmp/v_cndmask ladder over the special and subnormal codes; going through
+    fp16 with shifts and masks is substantially cheaper. Architectures with a
+    hardware convert keep using it.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030()
+
+
+@triton.jit
+def dequant_fp8_ue8m0(
+    x_uint8,
+    encoded_scale,
+    USE_FNUZ: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
+):
+    """Decode UE8M0 block-scaled FP8 to fp32: ``fp8(x) * 2**(encoded_scale-127)``.
+
+    With ``FP8_BITOPS`` the e4m3 code is widened to fp16 with integer ops and
+    converted by v_cvt_f32_f16. The layouts are mantissa-aligned and every e4m3
+    subnormal is a normal fp16, so this is exact for every code; e4m3 NaN is not
+    preserved, which this cache never stores.
+
+    The widening factor gets its own multiply. Folding it into the UE8M0
+    exponent saves an op but overflows for large scales and denormalises the
+    intermediate for small ones.
+    """
+    if FP8_BITOPS:
+        bits = x_uint8.to(tl.uint16)
+        bits = ((bits & 0x80) << 8) | ((bits & 0x7F) << 7)
+        widened = bits.to(tl.float16, bitcast=True).to(tl.float32) * (
+            128.0 if USE_FNUZ else 256.0
+        )
+        return widened * tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+    if USE_FNUZ:
+        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+    else:
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+    return x_fp8.to(tl.float32) * tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+
+
+@triton.jit
+def quant_fp8_to_uint8(
+    x,
+    USE_FNUZ: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
+):
+    """Encode fp32 as raw FP8 bytes, saturating like the convert instruction.
+
+    With ``FP8_BITOPS`` the normal range drops 20 mantissa bits round-to-nearest
+    -even and rebiases the exponent, while below the smallest normal
+    ``|x| * 2**-emin + 2**23`` lands the subnormal index in the low mantissa bits
+    already rounded. A tie carrying to 8 is exactly the smallest normal code, so
+    the two ranges join without a fixup.
+    """
+    fp8_max: tl.constexpr = 240.0 if USE_FNUZ else 448.0
+    if FP8_BITOPS:
+        # Callers already scale into range; the clamp is one v_med3_f32 and keeps
+        # out-of-range input saturating rather than wrapping into the NaN code.
+        u = tl.clamp(x, -fp8_max, fp8_max).to(tl.uint32, bitcast=True)
+        sign = (u >> 24) & 0x80
+        mag = u & 0x7FFFFFFF
+        absx = mag.to(tl.float32, bitcast=True)
+        code_normal = (mag + 0x7FFFF + ((mag >> 20) & 1) >> 20) - (
+            (119 if USE_FNUZ else 120) << 3
+        )
+        code_sub = (absx * (1024.0 if USE_FNUZ else 512.0) + 8388608.0).to(
+            tl.uint32, bitcast=True
+        ) & 0xF
+        smallest_normal: tl.constexpr = 0.0078125 if USE_FNUZ else 0.015625
+        code = tl.where(absx >= smallest_normal, code_normal, code_sub)
+        return (sign | code).to(tl.uint8)
+    x_fp8 = (
+        tl.clamp(x, -fp8_max, fp8_max).to(tl.float8e4b8)
+        if USE_FNUZ
+        else tl.clamp(x, -fp8_max, fp8_max).to(tl.float8e4nv)
+    )
+    return x_fp8.to(tl.uint8, bitcast=True)
 
 
 @triton.jit

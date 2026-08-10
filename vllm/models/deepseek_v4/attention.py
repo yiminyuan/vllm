@@ -80,10 +80,14 @@ def _resolve_dsv4_kv_cache_dtype(
     """
     if use_fp8_ds_mla_layout:
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
-            f"got {kv_cache_dtype}"
-        )
+        # It is the only layout these backends implement, so "auto" resolves to
+        # it below rather than erroring; any other fp8 spelling normalises too.
+        if kv_cache_dtype != "auto" and not kv_cache_dtype.startswith("fp8"):
+            raise ValueError(
+                f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
+                f"got {kv_cache_dtype}. Omit --kv-cache-dtype (or pass "
+                f"--kv-cache-dtype fp8_ds_mla) to use it."
+            )
         if kv_cache_dtype != "fp8_ds_mla":
             if cache_config is not None:
                 cache_config.cache_dtype = "fp8_ds_mla"

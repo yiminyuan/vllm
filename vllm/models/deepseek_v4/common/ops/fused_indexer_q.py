@@ -6,6 +6,10 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.attention.ops.common import (
+    quant_fp8_to_uint8,
+    use_fp8_bitops_decode,
+)
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -91,6 +95,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_out_stride,
     FP8_MAX: tl.constexpr = 448.0,
     USE_FNUZ: tl.constexpr = False,
+    FP8_BITOPS: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -143,16 +148,22 @@ def _fused_indexer_q_rope_quant_kernel(
     if INDEX_Q_NOPE_DIM > 0:
         tl.store(
             fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
+            quant_fp8_to_uint8(
+                tl.div_rn(x_nope, index_q_scale), USE_FNUZ, FP8_BITOPS
+            ).to(fp8_dtype, bitcast=True),
         )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
     tl.store(
         fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
+        quant_fp8_to_uint8(tl.div_rn(r_even, index_q_scale), USE_FNUZ, FP8_BITOPS).to(
+            fp8_dtype, bitcast=True
+        ),
     )
     tl.store(
         fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
+        quant_fp8_to_uint8(tl.div_rn(r_odd, index_q_scale), USE_FNUZ, FP8_BITOPS).to(
+            fp8_dtype, bitcast=True
+        ),
     )
 
     # FP8 weight-fold contract:
@@ -444,6 +455,7 @@ def fused_indexer_q_rope_quant(
             index_weights_out.stride(0),
             FP8_MAX=fp8_max,
             USE_FNUZ=use_fnuz,
+            FP8_BITOPS=use_fp8_bitops_decode(),
             num_warps=1,  # TODO: Tune this
         )
     return index_q_fp8, index_weights_out

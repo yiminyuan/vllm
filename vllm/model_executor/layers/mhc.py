@@ -17,11 +17,12 @@ def _has_tilelang_mhc() -> bool:
     if current_platform.is_cuda():
         return True
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx942
+        from vllm.platforms.rocm import on_gfx942, on_gfx1030
 
-        # TileLang MHC currently produces incorrect results on gfx942. Keep
-        # gfx942 on the existing torch/triton fallbacks until that path is fixed.
-        return not on_gfx942()
+        # TileLang MHC produces incorrect results on gfx942, and its kernels are
+        # bf16-only while RDNA2 has no bf16 dot product, so gfx1030 runs the
+        # model in fp16. Both stay on the torch/triton fallbacks.
+        return not (on_gfx942() or on_gfx1030())
     return False
 
 
@@ -117,6 +118,35 @@ class MHCPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
+        elif norm_weight is None:
+            hc_mult, hidden_size = residual.shape[-2:]
+            outer = residual.shape[:-2]
+            post_mix = torch.empty(
+                (*outer, hc_mult, 1), dtype=torch.float32, device=residual.device
+            )
+            comb_mix = torch.empty(
+                (*outer, hc_mult, hc_mult),
+                dtype=torch.float32,
+                device=residual.device,
+            )
+            layer_input = torch.empty(
+                (*outer, hidden_size), dtype=residual.dtype, device=residual.device
+            )
+            torch.ops.vllm.mhc_pre_triton(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                post_mix,
+                comb_mix,
+                layer_input,
+            )
+            return post_mix, comb_mix, layer_input
         else:
             return self.forward_native(
                 residual,
@@ -236,8 +266,9 @@ class MHCPostOp(CustomOp):
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
-        else:
-            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
+        out = torch.empty_like(residual)
+        torch.ops.vllm.mhc_post_triton(x, residual, post_layer_mix, comb_res_mix, out)
+        return out
 
     def forward_native(
         self,
@@ -332,7 +363,7 @@ class HCHeadOp(CustomOp):
             out = torch.empty(
                 num_tokens,
                 hidden_size,
-                dtype=torch.bfloat16,
+                dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
             torch.ops.vllm.hc_head_triton(
@@ -367,7 +398,10 @@ class HCHeadOp(CustomOp):
         num_tokens = hs_flat.shape[0]
 
         out = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+            num_tokens,
+            hidden_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         torch.ops.vllm.hc_head_triton(
             hs_flat,

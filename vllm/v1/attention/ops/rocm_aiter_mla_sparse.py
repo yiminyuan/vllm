@@ -15,7 +15,12 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
-from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.common import (
+    dequant_fp8_ue8m0,
+    pack_seq_triton,
+    unpack_seq_triton,
+    use_fp8_bitops_decode,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -1282,6 +1287,7 @@ def _sparse_attn_decode_ragged_kernel(
     # Compressed K-cache (extra): Triton encoder writes OCP everywhere.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1338,17 +1344,14 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = dequant_fp8_ue8m0(
+            x_uint8, encoded_scales, IS_FNUZ_MAIN, FP8_BITOPS
+        ).to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1406,17 +1409,14 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = dequant_fp8_ue8m0(
+                x_uint8, encoded_scales, IS_FNUZ_EXTRA, FP8_BITOPS
+            ).to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1523,6 +1523,7 @@ def _sparse_attn_decode_partial_kernel(
     # `IS_FNUZ` would decode one of them with the wrong FNUZ/OCP scale ratio.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -1588,17 +1589,14 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = dequant_fp8_ue8m0(
+            x_uint8, encoded_scales, IS_FNUZ_MAIN, FP8_BITOPS
+        ).to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1659,17 +1657,14 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = dequant_fp8_ue8m0(
+                x_uint8, encoded_scales, IS_FNUZ_EXTRA, FP8_BITOPS
+            ).to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -2103,6 +2098,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    fp8_bitops = use_fp8_bitops_decode()
 
     if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
@@ -2135,6 +2131,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             ROPE_DIM=rope_head_dim,
             IS_FNUZ_MAIN=is_fnuz,
             IS_FNUZ_EXTRA=False,
+            FP8_BITOPS=fp8_bitops,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             num_warps=8,
@@ -2198,6 +2195,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         # wrong FNUZ/OCP scale ratio (~1.87×).
         IS_FNUZ_MAIN=is_fnuz,
         IS_FNUZ_EXTRA=False,
+        FP8_BITOPS=fp8_bitops,
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
