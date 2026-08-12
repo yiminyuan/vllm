@@ -444,6 +444,120 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("act_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_size", [64, 256])
+def test_fused_insert_gather_roundtrip_covers_rope_half(
+    act_dtype: torch.dtype, block_size: int
+) -> None:
+    """The cached RoPE half must survive the fused insert, in any dtype.
+
+    It is stored as bf16 by layout while the activations may be fp16, so a test
+    that only checks the NoPE half passes even when the two disagree.
+    """
+    from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_tokens = 2 * block_size
+    num_blocks = num_tokens // block_size + 1
+
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=act_dtype, device=device) * 8
+    q = torch.randn(num_tokens, 64, HEAD_DIM, dtype=act_dtype, device=device)
+    cache = torch.zeros(num_blocks, block_size, 584, dtype=torch.uint8, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+    cos_sin = torch.zeros(num_tokens + 8, ROPE_HEAD_DIM, device=device)
+    # cos = 1, sin = 0 makes the rotation the identity, so the cached RoPE half
+    # must come back as the values that went in.
+    cos_sin[:, : ROPE_HEAD_DIM // 2] = 1.0
+
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q,
+        kv,
+        cache.view(cache.shape[0], -1),
+        slot_mapping,
+        positions,
+        cos_sin,
+        64,
+        1e-6,
+        block_size,
+    )
+
+    out = torch.zeros(1, num_tokens, HEAD_DIM, dtype=torch.float32, device=device)
+    lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    dequantize_and_gather_k_cache(
+        out,
+        cache,
+        seq_lens=lens,
+        gather_lens=lens,
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device)[None],
+        block_size=block_size,
+        offset=0,
+        use_fnuz=False,
+    )
+
+    rope_got = out[0, :, NOPE_HEAD_DIM:]
+    rope_ref = kv[:, NOPE_HEAD_DIM:].float()
+    torch.testing.assert_close(rope_got, rope_ref, atol=6e-2, rtol=6e-2)
+
+    nope_got = out[0, :, :NOPE_HEAD_DIM]
+    nope_ref = kv[:, :NOPE_HEAD_DIM].float()
+    denom = nope_ref.abs().max()
+    assert (nope_got - nope_ref).abs().max() / denom < 0.1
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_kv", [8, 64, 128, 512])
+@pytest.mark.parametrize("num_heads", [3, 64])
+def test_sparse_attn_prefill_matches_reference_at_model_dims(
+    num_heads: int, num_kv: int
+) -> None:
+    """Cover more keys than one tile, at the head count the model uses.
+
+    The other prefill test keeps every query inside a single BLOCK_K tile, so
+    the online-softmax rescaling between tiles never runs there.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_prefill_ragged_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_queries = 4
+    q = (
+        torch.randn(
+            num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.125
+    )
+    kv = torch.randn(num_kv, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    rows = [list(range(num_kv)) for _ in range(num_queries)]
+    indices, indptr = _ragged_from_rows(rows, device)
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.25
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_prefill_ragged_triton(
+        q=q,
+        kv=kv,
+        indices=indices,
+        indptr=indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    expected = _ref_sparse_prefill_ragged(q, kv, rows, scale, attn_sink)
+
+    # The output is a convex combination of kv rows, so it cannot be larger
+    # than the largest kv value regardless of tiling.
+    assert actual.float().abs().max() <= kv.float().abs().max() * 1.01, (
+        f"attention output {actual.float().abs().max():.6g} exceeds "
+        f"max |kv| {kv.float().abs().max():.6g}"
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
 def test_sparse_attn_decode_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_decode_ragged_triton,
