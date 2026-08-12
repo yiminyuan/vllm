@@ -5,8 +5,8 @@
 import torch
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -771,6 +771,11 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        if current_platform.is_rocm():
+            # Registers the ROCm op. It is triton and torch throughout and
+            # reaches for AITER only to accelerate the MQA logits, so it is not
+            # part of the AITER op registry.
+            import vllm.v1.attention.ops.rocm_aiter_mla_sparse  # noqa: F401
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -851,12 +856,13 @@ class SparseAttnIndexer(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        from vllm.platforms.rocm import on_gfx11
+        from vllm.platforms.rocm import on_gfx11, on_gfx1030
 
         if (
             rocm_aiter_ops.is_enabled()
             or rocm_aiter_ops.is_rdna_aiter_enabled()
             or on_gfx11()
+            or on_gfx1030()
         ):
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,

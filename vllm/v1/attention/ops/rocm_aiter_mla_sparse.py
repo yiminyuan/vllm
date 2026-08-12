@@ -13,9 +13,15 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import LayerNameType
+from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
-from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.common import (
+    dequant_fp8_ue8m0,
+    pack_seq_triton,
+    quant_fp8_to_uint8,
+    unpack_seq_triton,
+    use_fp8_bitops_decode,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -42,6 +48,7 @@ def _indexer_k_quant_and_cache_kernel(
     HEAD_TILE_SIZE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
+    FP8_BITOPS: tl.constexpr = False,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, head_dim)
@@ -74,7 +81,9 @@ def _indexer_k_quant_and_cache_kernel(
     if USE_UE8M0:
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
 
-    fp8_val = (val.to(tl.float32) / scale).to(kv_cache_ptr.type.element_ty)
+    fp8_val = quant_fp8_to_uint8(val.to(tl.float32) / scale, IS_FNUZ, FP8_BITOPS).to(
+        kv_cache_ptr.type.element_ty, bitcast=True
+    )
     if LAYOUT == "SHUFFLE":
         dst_ptr = (
             kv_cache_ptr
@@ -128,6 +137,7 @@ def indexer_k_quant_and_cache_triton(
         head_tile_size,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         USE_UE8M0=scale_fmt == "ue8m0",
+        FP8_BITOPS=use_fp8_bitops_decode(),
     )
 
 
@@ -588,8 +598,8 @@ def fp8_mqa_logits_torch(
     """
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
-    k = k_fp8.to(torch.bfloat16)
-    q = q.to(torch.bfloat16)
+    k = k_fp8.to(torch.float32)
+    q = q.to(torch.float32)
     device = q.device
 
     mask_lo = (
@@ -606,7 +616,7 @@ def fp8_mqa_logits_torch(
     # naked ``score * scale`` would align ``scale``'s leading dim with
     # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
     # broadcasting lines up with the last dim of ``score``.
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
+    score = torch.einsum("mhd,nd->hmn", q, k) * scale.reshape(-1)
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     logits = logits.masked_fill(~mask, float("-inf"))
 
@@ -907,6 +917,16 @@ def rocm_aiter_sparse_attn_indexer(
     return topk_indices_buffer
 
 
+if current_platform.is_rocm():
+    direct_register_custom_op(
+        op_name="rocm_aiter_sparse_attn_indexer",
+        op_func=rocm_aiter_sparse_attn_indexer,
+        mutates_args=["topk_indices_buffer"],
+        fake_impl=rocm_aiter_sparse_attn_indexer_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.float8_e8m0fnu:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -934,7 +954,7 @@ def _expand_2d_block_scales(
 @triton.jit
 def _inverse_rope_gptj_kernel(
     o_ptr,  # [T, H, D] input
-    out_ptr,  # [T, H, D] bf16 output
+    out_ptr,  # [T, H, D] output
     pos_ptr,  # [T] positions
     cos_sin_ptr,  # [P, rope_dim] fp32 (cos[:half] | sin[half:])
     s_t,
@@ -950,20 +970,20 @@ def _inverse_rope_gptj_kernel(
     """Fused inverse GPT-J RoPE on the trailing rope_dim of each (token, head).
 
     Mirrors ``DeepseekV4ScalingRotaryEmbedding.forward_native(inverse=True)``
-    for the GPT-J (non-neox) layout, writing bf16 directly. Replaces the
-    clone + index_select + repeat_interleave + neg + stack + cat + cast chain
-    (~10 small kernels) with a single launch.
+    for the GPT-J (non-neox) layout, writing the output dtype directly.
+    Replaces the clone + index_select + repeat_interleave + neg + stack + cat
+    + cast chain (~10 small kernels) with a single launch.
     """
     t = tl.program_id(0)
     h = tl.program_id(1)
     in_base = t * s_t + h * s_h
     out_base = t * os_t + h * os_h
 
-    # NoPE lanes pass through unchanged (only cast to bf16).
+    # NoPE lanes pass through unchanged (only cast to the output dtype).
     n = tl.arange(0, BLOCK_NOPE)
     nmask = n < NOPE
     vals = tl.load(o_ptr + in_base + n, mask=nmask)
-    tl.store(out_ptr + out_base + n, vals.to(tl.bfloat16), mask=nmask)
+    tl.store(out_ptr + out_base + n, vals.to(out_ptr.dtype.element_ty), mask=nmask)
 
     # RoPE lanes: out_even = a*cos + b*sin, out_odd = b*cos - a*sin
     # (a = even lane, b = odd lane; sin negated for the inverse rotation).
@@ -976,8 +996,16 @@ def _inverse_rope_gptj_kernel(
     sin = tl.load(cos_sin_ptr + pos * cs_stride + HALF + k, mask=kmask)
     out_even = a * cos + b * sin
     out_odd = b * cos - a * sin
-    tl.store(out_ptr + out_base + NOPE + 2 * k, out_even.to(tl.bfloat16), mask=kmask)
-    tl.store(out_ptr + out_base + NOPE + 2 * k + 1, out_odd.to(tl.bfloat16), mask=kmask)
+    tl.store(
+        out_ptr + out_base + NOPE + 2 * k,
+        out_even.to(out_ptr.dtype.element_ty),
+        mask=kmask,
+    )
+    tl.store(
+        out_ptr + out_base + NOPE + 2 * k + 1,
+        out_odd.to(out_ptr.dtype.element_ty),
+        mask=kmask,
+    )
 
 
 def _fused_inverse_rope_gptj(
@@ -998,9 +1026,7 @@ def _fused_inverse_rope_gptj(
         f"[P, {rope_head_dim}] = cos | sin, got {tuple(cos_sin_cache.shape)}"
     )
     num_tokens, num_heads, head_dim = o.shape
-    out = torch.empty(
-        (num_tokens, num_heads, head_dim), dtype=torch.bfloat16, device=o.device
-    )
+    out = torch.empty((num_tokens, num_heads, head_dim), dtype=o.dtype, device=o.device)
     if num_tokens == 0:
         return out
     _inverse_rope_gptj_kernel[(num_tokens, num_heads)](
@@ -1021,22 +1047,23 @@ def _fused_inverse_rope_gptj(
     return out
 
 
-def _get_cached_wo_a_bf16(
+def _get_cached_wo_a(
     wo_a: torch.nn.Module,
     n_local_groups: int,
     o_lora_rank: int,
     hidden_dim: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Dequantize wo_a to bf16 once and cache it on the module.
+    """Dequantize wo_a to the activation dtype once and cache it on the module.
 
-    wo_a weights are static, so the fp8 -> fp32 -> (* block scale) -> bf16
-    dequant only needs to run once. Recomputing it every decode step shows up
+    wo_a weights are static, so the fp8 -> fp32 -> (* block scale) -> activation
+    dtype dequant only needs to run once. Recomputing it every decode step shows up
     in the profile as the largest copy/mul kernels (``direct_copy float`` ~55us
     and ``MulFunctor float`` ~31us per two layers). SGLang / ATOM keep wo_a in
-    bf16 and feed a plain bf16 GEMM; this mirrors that.
+    the activation dtype and feed a plain GEMM; this mirrors that.
     """
-    cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
-    if cached is not None:
+    cached = getattr(wo_a, "_dsv4_wo_a_cached", None)
+    if cached is not None and cached.dtype == dtype:
         return cached
     if hasattr(wo_a, "weight_scale_inv"):
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
@@ -1049,12 +1076,10 @@ def _get_cached_wo_a_bf16(
             o_lora_rank,
             hidden_dim,
         )
-        cached = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+        cached = (wo_a_weight * wo_a_scale).to(dtype)
     else:
-        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.bfloat16
-        )
-    wo_a._dsv4_wo_a_bf16 = cached
+        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(dtype)
+    wo_a._dsv4_wo_a_cached = cached
     return cached
 
 
@@ -1069,16 +1094,16 @@ def rocm_inv_rope_einsum(
 ) -> torch.Tensor:
     """Inverse-RoPE + WO_A bmm path used on ROCm.
 
-    Fuses the inverse GPT-J RoPE into one Triton kernel and caches the bf16
-    wo_a weight so the per-step dequant disappears.
+    Fuses the inverse GPT-J RoPE into one Triton kernel and caches the
+    dequantized wo_a weight so the per-step dequant disappears.
     """
     o_ref = _fused_inverse_rope_gptj(
         o, positions, rotary_emb.cos_sin_cache, rope_head_dim
     )
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
-    wo_a_weight = _get_cached_wo_a_bf16(
-        wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]
+    wo_a_weight = _get_cached_wo_a(
+        wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1], o_ref.dtype
     )
 
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
@@ -1419,6 +1444,7 @@ def _sparse_attn_decode_ragged_kernel(
     # Compressed K-cache (extra): Triton encoder writes OCP everywhere.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1454,8 +1480,9 @@ def _sparse_attn_decode_ragged_kernel(
     main_end = tl.load(main_indptr_ptr + query_idx + 1)
     main_len = main_end - main_start
 
-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+    kv_dtype = q_nope.dtype
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=kv_dtype)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=kv_dtype)
 
     for k_start in tl.range(0, main_len, BLOCK_K):
         k_pos = k_start + k_offsets
@@ -1475,17 +1502,14 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = dequant_fp8_ue8m0(
+            x_uint8, encoded_scales, IS_FNUZ_MAIN, FP8_BITOPS
+        ).to(kv_dtype)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1495,6 +1519,7 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        k_rope = k_rope.to(kv_dtype)
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1543,17 +1568,14 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = dequant_fp8_ue8m0(
+                x_uint8, encoded_scales, IS_FNUZ_EXTRA, FP8_BITOPS
+            ).to(kv_dtype)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1563,6 +1585,7 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
+            k_rope = k_rope.to(kv_dtype)
             k_rope = tl.where(valid[:, None], k_rope, zero_rope)
             k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1660,6 +1683,7 @@ def _sparse_attn_decode_partial_kernel(
     # `IS_FNUZ` would decode one of them with the wrong FNUZ/OCP scale ratio.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -1694,8 +1718,9 @@ def _sparse_attn_decode_partial_kernel(
     acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
     k_offsets = tl.arange(0, BLOCK_K)
 
-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+    kv_dtype = q_nope.dtype
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=kv_dtype)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=kv_dtype)
 
     # Each split processes a contiguous slice of this query's main (SWA) and
     # extra (topk) segments. Slices are handled independently so a block never
@@ -1725,17 +1750,14 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = dequant_fp8_ue8m0(
+            x_uint8, encoded_scales, IS_FNUZ_MAIN, FP8_BITOPS
+        ).to(kv_dtype)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1745,6 +1767,7 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        k_rope = k_rope.to(kv_dtype)
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1796,17 +1819,14 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = dequant_fp8_ue8m0(
+                x_uint8, encoded_scales, IS_FNUZ_EXTRA, FP8_BITOPS
+            ).to(kv_dtype)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1816,6 +1836,7 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
+            k_rope = k_rope.to(kv_dtype)
             k_rope = tl.where(valid[:, None], k_rope, zero_rope)
             k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -2421,7 +2442,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
     num_warps = 4
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -2698,19 +2719,20 @@ def _rocm_sparse_attn_decode_ragged_triton(
 
     block_h = 16
     if out is None:
-        out = torch.empty_like(q, dtype=torch.bfloat16)
+        out = torch.empty_like(q)
     else:
         assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
         assert out.device == q.device, (
             f"expected out on device {q.device}, got {out.device}"
         )
-        assert out.dtype == torch.bfloat16, (
-            f"expected out dtype {torch.bfloat16}, got {out.dtype}"
+        assert out.dtype == q.dtype, (
+            f"expected out dtype {q.dtype}, got {out.dtype}"
         )
     heads_blocks = triton.cdiv(num_heads, block_h)
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    fp8_bitops = use_fp8_bitops_decode()
 
     if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
@@ -2743,6 +2765,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             ROPE_DIM=rope_head_dim,
             IS_FNUZ_MAIN=is_fnuz,
             IS_FNUZ_EXTRA=False,
+            FP8_BITOPS=fp8_bitops,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             num_warps=8,
@@ -2867,6 +2890,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             # wrong FNUZ/OCP scale ratio (~1.87×).
             IS_FNUZ_MAIN=is_fnuz,
             IS_FNUZ_EXTRA=False,
+            FP8_BITOPS=fp8_bitops,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,

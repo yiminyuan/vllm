@@ -13,10 +13,6 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import PlaceholderModule
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-    rocm_aiter_sparse_attn_indexer,
-    rocm_aiter_sparse_attn_indexer_fake,
-)
 
 logger = init_logger(__name__)
 
@@ -2030,20 +2026,9 @@ class rocm_aiter_ops:
         if not (
             is_aiter_found_and_supported() or is_aiter_found_and_supported_on_rdna4()
         ):
-            if not current_platform.is_rocm():
-                return
-
-            from vllm.platforms.rocm import on_gfx11
-
-            if on_gfx11() and not _OPS_REGISTERED:
-                direct_register_custom_op(
-                    op_name="rocm_aiter_sparse_attn_indexer",
-                    op_func=rocm_aiter_sparse_attn_indexer,
-                    mutates_args=["topk_indices_buffer"],
-                    fake_impl=rocm_aiter_sparse_attn_indexer_fake,
-                    dispatch_key=current_platform.dispatch_key,
-                )
-                _OPS_REGISTERED = True
+            # rocm_aiter_sparse_attn_indexer is registered for every ROCm target
+            # in v1/attention/ops/rocm_aiter_mla_sparse.py, which covers gfx11 and
+            # gfx1030 alike. Registering it again here would be a duplicate.
             return
 
         if not _OPS_REGISTERED:
@@ -2210,14 +2195,6 @@ class rocm_aiter_ops:
                 op_name="rocm_aiter_per_token_quant",
                 op_func=_rocm_aiter_per_token_quant_impl,
                 fake_impl=_rocm_aiter_per_token_quant_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_sparse_attn_indexer",
-                op_func=rocm_aiter_sparse_attn_indexer,
-                mutates_args=["topk_indices_buffer"],
-                fake_impl=rocm_aiter_sparse_attn_indexer_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
