@@ -185,6 +185,10 @@ __device__ __forceinline__ void processDeepseekV4Slot(
     float const* __restrict__ cos_sin_cache, int const cache_block_size,
     int const kv_block_stride) {
   using Converter = vllm::_typeConvert<scalar_t_in>;
+  // The cached RoPE half is bf16 by layout, independent of the activation
+  // dtype: get_kv_cache_shape sizes it as bf16 and every reader loads it that
+  // way, so store it as bf16 rather than following scalar_t_in.
+  using RopeConverter = vllm::_typeConvert<torch::headeronly::BFloat16>;
   bool const isKV = (slotIdx == kNumHeadsQPadded);
   bool const isPadQ = !isKV && (slotIdx >= num_heads_q);
 
@@ -354,23 +358,24 @@ __device__ __forceinline__ void processDeepseekV4Slot(
         }
       } else {
         uint4 out0, out1;
-        typename Converter::packed_hip_type* po0 =
-            reinterpret_cast<typename Converter::packed_hip_type*>(&out0);
-        typename Converter::packed_hip_type* po1 =
-            reinterpret_cast<typename Converter::packed_hip_type*>(&out1);
+        typename RopeConverter::packed_hip_type* po0 =
+            reinterpret_cast<typename RopeConverter::packed_hip_type*>(&out0);
+        typename RopeConverter::packed_hip_type* po1 =
+            reinterpret_cast<typename RopeConverter::packed_hip_type*>(&out1);
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          po0[i] = Converter::convert(
+          po0[i] = RopeConverter::convert(
               make_float2(elements[2 * i], elements[2 * i + 1]));
         }
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          po1[i] = Converter::convert(
+          po1[i] = RopeConverter::convert(
               make_float2(elements[8 + 2 * i], elements[8 + 2 * i + 1]));
         }
         int const rope_local_base = dim_base - kNopeDim;
-        scalar_t_in* bf16_dst =
-            reinterpret_cast<scalar_t_in*>(token_bf16_ptr) + rope_local_base;
+        torch::headeronly::BFloat16* bf16_dst =
+            reinterpret_cast<torch::headeronly::BFloat16*>(token_bf16_ptr) +
+            rope_local_base;
         *reinterpret_cast<uint4*>(bf16_dst) = out0;
         *reinterpret_cast<uint4*>(bf16_dst + 8) = out1;
       }
@@ -726,6 +731,10 @@ __global__ void fusedDeepseekV4FullCacheKernel(
   } else {
 #endif
     using Converter = vllm::_typeConvert<scalar_t_in>;
+  // The cached RoPE half is bf16 by layout, independent of the activation
+  // dtype: get_kv_cache_shape sizes it as bf16 and every reader loads it that
+  // way, so store it as bf16 rather than following scalar_t_in.
+  using RopeConverter = vllm::_typeConvert<torch::headeronly::BFloat16>;
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
