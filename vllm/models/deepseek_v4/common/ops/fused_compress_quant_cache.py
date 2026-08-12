@@ -26,6 +26,10 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.common import (
+    quant_fp8_to_uint8,
+    use_fp8_bitops_decode,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -62,20 +66,23 @@ def compress_norm_rope_store_triton(
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
     Picks one of the three kernels in this module based on ``head_dim`` and
-    ``use_fp4_cache``. Identical launch signature for all three.
+    ``use_fp4_cache``. Identical launch signature for all three, except that the
+    MXFP4 kernel stores FP4 and so takes no FP8 encoder selector.
     """
+    kernel_kwargs = {"FP8_BITOPS": use_fp8_bitops_decode()}
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
-        kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
+        kernel_kwargs["SANITIZE_CACHE_NANS"] = _ON_GFX950
     elif use_fp4_cache:
+        # MXFP4 stores FP4: neither the FP8 encoder selector nor the sanitiser.
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
         num_warps = 1
         kernel_kwargs = {}
     else:
+        # Indexer FP8 path: keeps the FP8 encoder selector, takes no NaN sanitiser.
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
-        kernel_kwargs = {}
 
     kernel[(num_actual,)](
         # state cache
@@ -156,6 +163,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FP8_BITOPS: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -263,8 +271,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8 = quant_fp8_to_uint8(x_clamped, False, FP8_BITOPS)
     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
@@ -432,6 +439,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FP8_BITOPS: tl.constexpr = False,
 ):
     """Stage 2: read compressed_kv[512] from scratch buffer, then
     RMSNorm + FP8 quant (nope) + RoPE + bf16 store
@@ -483,8 +491,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     x_uint8 = tl.reshape(
-        x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
-        (TRITON_BLOCK_SIZE,),
+        quant_fp8_to_uint8(x_clamped, False, FP8_BITOPS), (TRITON_BLOCK_SIZE,)
     )
     tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
 
@@ -583,6 +590,7 @@ def _launch_two_stage_sparse_attn_compressor(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         SANITIZE_CACHE_NANS=_ON_GFX950,
+        FP8_BITOPS=use_fp8_bitops_decode(),
     )
 
 
@@ -708,6 +716,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    FP8_BITOPS: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -837,8 +846,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8 = quant_fp8_to_uint8(x_clamped, False, FP8_BITOPS)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 

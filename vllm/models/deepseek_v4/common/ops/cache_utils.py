@@ -31,6 +31,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.ops.common import (
+    dequant_fp8_ue8m0,
+    quant_fp8_to_uint8,
+    use_fp8_bitops_decode,
+)
 
 
 @triton.jit
@@ -53,6 +58,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    fp8_bitops: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -129,12 +135,8 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
-            if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
-            else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere) as raw bytes.
+            x_uint8 = quant_fp8_to_uint8(x_clamped, use_fnuz, fp8_bitops)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -184,7 +186,9 @@ def quantize_and_insert_k_cache(
     assert k.dim() == 2 and k.shape[1] == 512, (
         f"K must be [num_tokens, 512], got {k.shape}"
     )
-    assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    assert k.dtype in (torch.bfloat16, torch.float16), (
+        f"K must be bf16 or fp16, got {k.dtype}"
+    )
     assert is_ue8m0, "Only support ue8m0 quantization."
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
@@ -222,6 +226,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        fp8_bitops=use_fp8_bitops_decode(),
     )
 
 
@@ -248,6 +253,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    fp8_bitops: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -305,26 +311,18 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-                else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
+                # Decode fp8 (FNUZ on gfx942, OCP elsewhere) and apply the
+                # UE8M0 scale, scale = 2^(stored_value - 127).
                 encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
+                x_dequant = dequant_fp8_ue8m0(
+                    x_uint8, encoded_scale, use_fnuz, fp8_bitops
+                )
 
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
-
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                tl.store(
+                    output_row_ptr + offsets,
+                    x_dequant.to(out_ptr.dtype.element_ty),
+                    mask=mask,
+                )
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -384,6 +382,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        fp8_bitops=use_fp8_bitops_decode(),
     )
 
 
