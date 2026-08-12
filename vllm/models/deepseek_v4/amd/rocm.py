@@ -547,7 +547,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: no real metadata. Reserve the same bf16
+            # Warmup dummy run: no real metadata. Reserve the same
             # gather workspace _forward_prefill would; the dequantize / topk
             # / sparse_fwd kernels are skipped this step.
             swa_only = self.compress_ratio <= 1
@@ -559,7 +559,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             M = N + self.window_size + self.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), q.dtype),
             )
             output.zero_()
             return
@@ -716,7 +716,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
-            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), q.dtype),
         )[0]
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE

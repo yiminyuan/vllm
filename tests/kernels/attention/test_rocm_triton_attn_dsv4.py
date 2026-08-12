@@ -649,8 +649,8 @@ def test_rocm_inv_rope_einsum_matches_rotary_native(default_vllm_config) -> None
 
 
 @torch.inference_mode()
-def test_get_cached_wo_a_bf16_plain_caches() -> None:
-    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _get_cached_wo_a_bf16
+def test_get_cached_wo_a_plain_caches() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _get_cached_wo_a
 
     device = torch.device("cuda")
     torch.manual_seed(4)
@@ -660,23 +660,27 @@ def test_get_cached_wo_a_bf16_plain_caches() -> None:
     )
     wo_a = _FakeWoA(weight)
 
-    out1 = _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+    out1 = _get_cached_wo_a(
+        wo_a, n_local_groups, o_lora_rank, hidden_dim, torch.bfloat16
+    )
     expected = weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
     assert out1.shape == (n_local_groups, o_lora_rank, hidden_dim)
     torch.testing.assert_close(out1, expected, atol=0, rtol=0)
-    assert hasattr(wo_a, "_dsv4_wo_a_bf16")
+    assert hasattr(wo_a, "_dsv4_wo_a_cached")
 
     # Mutate the source weight: the cached tensor must be returned unchanged
     # (proving the dequant is not recomputed per call).
     wo_a.weight.zero_()
-    out2 = _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+    out2 = _get_cached_wo_a(
+        wo_a, n_local_groups, o_lora_rank, hidden_dim, torch.bfloat16
+    )
     assert out2 is out1
     torch.testing.assert_close(out2, expected, atol=0, rtol=0)
 
 
 @torch.inference_mode()
-def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
-    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _get_cached_wo_a_bf16
+def test_get_cached_wo_a_fp8_blockscale_caches() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _get_cached_wo_a
 
     device = torch.device("cuda")
     torch.manual_seed(5)
@@ -705,7 +709,9 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
         weight_scale_inv=scale.reshape(n_local_groups * row_blocks, col_blocks),
     )
 
-    out = _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+    out = _get_cached_wo_a(
+        wo_a, n_local_groups, o_lora_rank, hidden_dim, torch.bfloat16
+    )
 
     scale_full = scale.repeat_interleave(row_block, dim=-2).repeat_interleave(
         col_block, dim=-1
@@ -715,4 +721,7 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
     # Second call returns the same cached object.
-    assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+    assert (
+        _get_cached_wo_a(wo_a, n_local_groups, o_lora_rank, hidden_dim, torch.bfloat16)
+        is out
+    )
