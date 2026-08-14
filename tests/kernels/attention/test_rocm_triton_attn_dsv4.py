@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1421,6 +1422,75 @@ def test_rocm_inv_rope_einsum_matches_rotary_native(default_vllm_config) -> None
 
     assert actual.shape == (num_tokens, n_local_groups, o_lora_rank)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 5, 6, 8, 9, 64])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_wo_a_project_matches_einsum(num_tokens, dtype) -> None:
+    """Both branches must agree; ``num_tokens`` straddles the GEMV cutoff."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _wo_a_project
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    num_groups, o_lora_rank, hidden = 2, 1024, 4096
+
+    o_ref = (
+        torch.randn(num_tokens, num_groups, hidden, dtype=dtype, device=device) * 0.125
+    )
+    wo_a_weight = (
+        torch.randn(num_groups, o_lora_rank, hidden, dtype=dtype, device=device) * 0.125
+    )
+
+    actual = _wo_a_project(o_ref, wo_a_weight)
+    expected = torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+
+    assert actual.shape == (num_tokens, num_groups, o_lora_rank)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden,takes_kernel",
+    [
+        (1, 4096, True),
+        # 1 bonus + 5 draft tokens: the width every speculative decode step has.
+        (6, 4096, True),
+        (8, 4096, True),  # activation is exactly the 64 KiB LDS budget
+        (9, 4096, False),  # one token past it the kernel streams and loses
+        (16, 1024, True),  # a smaller reduction dim stages more tokens
+        (17, 1024, False),  # ...but never more than the kernel is built for
+        (0, 4096, False),
+    ],
+)
+@torch.inference_mode()
+def test_wo_a_project_gate_tracks_lds_budget(
+    num_tokens, hidden, takes_kernel, monkeypatch
+) -> None:
+    """Pin which branch runs, not only that the two agree.
+
+    Agreement holds either way, which is how a bound of 5 tokens survived here:
+    it was invisible to the numerical test above and sent every speculative
+    decode step back to the vendor GEMM.
+    """
+    import vllm.envs as envs
+
+    from vllm import _custom_ops as ops
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _wo_a_project
+
+    monkeypatch.setattr(envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: True)
+    grouped = MagicMock(side_effect=lambda w, a: torch.einsum("tgd,grd->tgr", a, w))
+    monkeypatch.setattr(ops, "wvSplitK_rdna2_grouped", grouped)
+
+    num_groups, o_lora_rank = 2, 1024
+    o_ref = torch.zeros(num_tokens, num_groups, hidden, dtype=torch.float16)
+    wo_a_weight = torch.zeros(num_groups, o_lora_rank, hidden, dtype=torch.float16)
+
+    out = _wo_a_project(o_ref, wo_a_weight)
+
+    assert grouped.called is takes_kernel
+    assert out.shape == (num_tokens, num_groups, o_lora_rank)
 
 
 @torch.inference_mode()

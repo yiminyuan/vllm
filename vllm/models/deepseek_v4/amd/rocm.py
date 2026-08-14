@@ -6,6 +6,8 @@ from typing import cast
 
 import torch
 
+from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -547,6 +549,27 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
             )
         return super()._fused_wqa_wkv_gemm(hidden_states)
+
+    def _kv_score_gemm(
+        self, hidden_states: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        # A bare mm never reaches the unquantized ROCm dispatch, so the RDNA2
+        # GEMV has to be selected here instead. Its accumulator is fp32 either
+        # way, so keeping the fp32 result costs nothing over the vendor GEMM.
+        from vllm.platforms.rocm import GFX1030_SKINNY_GEMV_MAX_TOKENS, on_gfx1030
+
+        num_tokens = hidden_states.shape[0]
+        if (
+            envs.VLLM_ROCM_USE_SKINNY_GEMM
+            and on_gfx1030()
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and weight.shape[1] % 8 == 0
+            and 0 < num_tokens <= GFX1030_SKINNY_GEMV_MAX_TOKENS
+        ):
+            return ops.wvSplitK_rdna2(weight, hidden_states, None, torch.float32)
+        return super()._kv_score_gemm(hidden_states, weight)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.

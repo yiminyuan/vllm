@@ -237,6 +237,13 @@ _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
 # csrc/rocm/skinny_gemms_rdna2.cu -- keep the two in step.
 GFX1030_SKINNY_GEMV_MAX_TOKENS = 16
 
+# LDS budget the same kernel stages the activation in. Past it the kernel still
+# runs, but streams the activation from global instead, which costs about 2x, so
+# a caller choosing between this kernel and a vendor GEMM wants a bound that
+# moves with the reduction dim rather than a fixed token count. Mirrors
+# LDS_BYTES in csrc/rocm/skinny_gemms_rdna2.cu -- keep the two in step.
+GFX1030_SKINNY_GEMV_LDS_BYTES = 64 * 1024
+
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
     """
