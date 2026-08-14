@@ -344,6 +344,232 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+def _ref_paged_mqa_logits(
+    q, kv_cache, weights, context_lens, block_tables, max_model_len
+):
+    """Readable reference following the layout the cache writer produces."""
+    batch, next_n, _, head_dim = q.shape
+    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+    flat = kv_cache.reshape(num_blocks, -1)
+    vals = (
+        flat[:, : block_size * head_dim]
+        .view(torch.float8_e4m3fn)
+        .float()
+        .reshape(num_blocks, block_size, head_dim)
+    )
+    scales = (
+        flat[:, block_size * head_dim :]
+        .view(torch.float32)
+        .reshape(num_blocks, block_size)
+    )
+
+    lens = context_lens.reshape(batch, -1)
+    out = torch.full((batch * next_n, max_model_len), float("-inf"), device=q.device)
+    for b in range(batch):
+        for j in range(next_n):
+            m = b * next_n + j
+            if lens.shape[1] == next_n:
+                last = int(lens[b, j]) - 1
+            else:
+                last = int(lens[b, 0]) - next_n + j
+            for blk in range(min(max_model_len // block_size, block_tables.shape[1])):
+                bid = int(block_tables[b, blk])
+                score = torch.relu(vals[bid] @ q[b, j].float().T)  # [block, heads]
+                logit = (score * weights[m]).sum(-1) * scales[bid]
+                n = blk * block_size + torch.arange(block_size, device=q.device)
+                out[m, blk * block_size : (blk + 1) * block_size] = torch.where(
+                    n <= last, logit, float("-inf")
+                )
+    return out
+
+
+def _build_indexer_cache(num_blocks, block_size, head_dim, device):
+    """Blocks of ``block_size`` fp8 rows followed by one fp32 scale per row."""
+    vals = (torch.randn(num_blocks, block_size, head_dim, device=device) * 2).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.rand(num_blocks, block_size, device=device) + 0.5
+    flat = torch.empty(
+        num_blocks, block_size * (head_dim + 4), dtype=torch.uint8, device=device
+    )
+    flat[:, : block_size * head_dim] = vals.view(torch.uint8).reshape(num_blocks, -1)
+    flat[:, block_size * head_dim :] = scales.view(torch.uint8).reshape(num_blocks, -1)
+    return flat.view(num_blocks, block_size, 1, head_dim + 4)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("next_n,per_position", [(1, False), (1, True), (2, False)])
+def test_paged_mqa_logits_triton_matches_reference(
+    next_n: int, per_position: bool
+) -> None:
+    """The device-side kernel must reproduce the logits it replaces.
+
+    The production torch path reads each length back to the host, which cannot
+    run under a graph capture, so this kernel takes over decode; the two have to
+    agree everywhere including the -inf beyond each context. For a single query
+    per sequence the production path is checked too, which is the case that runs
+    today.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+        paged_mqa_logits_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, heads, head_dim, block_size, num_blocks = 3, 64, 128, 64, 12
+    max_model_len = 512
+    max_blocks = max_model_len // block_size
+
+    kv_cache = _build_indexer_cache(num_blocks, block_size, head_dim, device)
+    q = (torch.randn(batch, next_n, heads, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.rand(batch * next_n, heads, device=device, dtype=torch.float32)
+    block_tables = (
+        torch.arange(max_blocks, dtype=torch.int32, device=device).repeat(batch, 1)
+        % num_blocks
+    )
+    lens = torch.tensor([300, 64, 129], dtype=torch.int32, device=device)
+    context_lens = (
+        lens.reshape(batch, 1).expand(batch, next_n).contiguous()
+        if per_position
+        else lens
+    )
+
+    expected = _ref_paged_mqa_logits(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+    out = torch.empty_like(expected)
+    actual = paged_mqa_logits_triton(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len, out
+    )
+
+    assert torch.equal(torch.isinf(actual), torch.isinf(expected)), (
+        "masked region differs"
+    )
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=2e-2, rtol=2e-3)
+
+    if next_n == 1:
+        production = fp8_paged_mqa_logits_torch(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
+        torch.testing.assert_close(
+            actual[finite], production[finite], atol=2e-2, rtol=2e-3
+        )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("block_stride_mult", [1, 4, 57])
+def test_paged_mqa_logits_honours_the_cache_row_stride(
+    block_stride_mult: int,
+) -> None:
+    """The decode logits must address the cache by its real row stride.
+
+    Deployment hands this kernel a strided view into the shared KV pool: a
+    block's rows are contiguous, but consecutive blocks are not. Measured on the
+    served model the row stride is 478080 bytes against the 8448 a packed cache
+    would have. Every other fixture in this file allocates the cache tightly, so
+    the assumed stride happens to be correct and the kernel passes while
+    misreading every block in production -- the decode top-k then selects on
+    unrelated memory, which is invisible here without an unpacked cache.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+        indexer_k_quant_and_cache_triton,
+        paged_mqa_logits_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    heads, head_dim, block_size, next_n, context = 64, 128, 64, 6, 4800
+    row = head_dim + 4
+    max_blocks = -(-context // block_size)
+    max_model_len = max_blocks * block_size
+    num_blocks = max_blocks + 2
+
+    # A block's own rows stay packed; the gap sits between blocks.
+    stride = block_size * row * block_stride_mult
+    backing = torch.zeros(num_blocks * stride, dtype=torch.uint8, device=device)
+    cache = torch.as_strided(backing, (num_blocks, block_size, row),
+                             (stride, row, 1))
+    assert cache.is_contiguous() == (block_stride_mult == 1)
+
+    n = num_blocks * block_size
+    k = torch.randn(n, head_dim, dtype=torch.float16, device=device) * 2
+    indexer_k_quant_and_cache_triton(
+        k, cache, torch.arange(n, dtype=torch.int64, device=device), 128, "ue8m0"
+    )
+
+    q = (torch.randn(1, next_n, heads, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.rand(next_n, heads, device=device, dtype=torch.float32)
+    block_tables = (
+        torch.arange(max_blocks, dtype=torch.int32, device=device).unsqueeze(0)
+        % num_blocks
+    )
+    lens = torch.full((1, next_n), context, dtype=torch.int32, device=device)
+    lens = lens - next_n + 1 + torch.arange(
+        next_n, device=device, dtype=torch.int32
+    )
+
+    kv = cache.unsqueeze(-2)
+    out = torch.empty(next_n, max_model_len, dtype=torch.float32, device=device)
+    actual = paged_mqa_logits_triton(q, kv, weights, lens, block_tables,
+                                     max_model_len, out)
+    expected = fp8_paged_mqa_logits_torch(q, kv, weights, lens, block_tables,
+                                          max_model_len)
+
+    assert torch.equal(torch.isinf(actual), torch.isinf(expected)), (
+        "masked region differs"
+    )
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(actual[finite], expected[finite],
+                               atol=2e-2, rtol=2e-3)
+
+    # The selection is what the indexer consumes, so assert it directly.
+    for r in range(actual.shape[0]):
+        valid = int((~torch.isinf(expected[r])).sum())
+        kk = min(512, valid)
+        want = set(expected[r].topk(kk).indices.tolist())
+        got = set(actual[r].topk(kk).indices.tolist())
+        assert want == got, f"row {r}: top-{kk} selection differs"
+
+@pytest.mark.parametrize(
+    "aiter,gfx942,expected",
+    [
+        (False, False, (7, 512)),
+        (False, True, (7, 512)),
+        (True, True, (7, 512)),
+        (True, False, (3, 7, 512)),
+    ],
+)
+def test_paged_mqa_logits_workspace_matches_the_selected_path(
+    monkeypatch, aiter: bool, gfx942: bool, expected
+) -> None:
+    """The reservation must claim exactly what the chosen kernel writes.
+
+    Reserving less risks an allocation failure once the kernel runs; reserving
+    the per-head buffer where the path returns reduced logits costs one float
+    per head per token of context, which is the difference between a long
+    context fitting and not.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mla
+
+    monkeypatch.setattr(mla, "_ON_GFX942", gfx942)
+    monkeypatch.setattr(mla, "_ON_GFX950", False)
+    monkeypatch.setattr(
+        mla, "paged_mqa_logits_module", lambda: object() if aiter else None
+    )
+    monkeypatch.setattr(
+        "vllm._aiter_ops.rocm_aiter_ops.is_enabled", staticmethod(lambda: aiter)
+    )
+
+    assert mla.paged_mqa_logits_workspace_shape(3, 7, 512) == expected
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("act_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("block_size", [64, 256])
@@ -839,3 +1065,210 @@ def test_get_cached_wo_a_fp8_blockscale_caches() -> None:
         _get_cached_wo_a(wo_a, n_local_groups, o_lora_rank, hidden_dim, torch.bfloat16)
         is out
     )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("next_n", [1, 2, 6])
+def test_paged_mqa_logits_matches_reference_at_production_shapes(next_n: int) -> None:
+    """The shapes this kernel actually decodes at.
+
+    The other paged-logits test runs at block_size 64 with contexts of 64-300
+    tokens, but deployment sets --block-size 256 and the sparse indexer only
+    engages past 2048 tokens of context -- below that the model takes the
+    short-context branch and never calls this kernel at all. So the covered
+    regime and the live regime do not overlap. next_n 6 is the DSpark shape
+    (num_speculative_tokens 5 plus the verified token).
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+        paged_mqa_logits_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, heads, head_dim, block_size = 3, 64, 128, 256
+    max_model_len = 9216
+    max_blocks = max_model_len // block_size
+    num_blocks = max_blocks * batch
+
+    kv_cache = _build_indexer_cache(num_blocks, block_size, head_dim, device)
+    q = (torch.randn(batch, next_n, heads, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.rand(batch * next_n, heads, device=device, dtype=torch.float32)
+    block_tables = torch.arange(
+        num_blocks, dtype=torch.int32, device=device
+    ).reshape(batch, max_blocks)
+    lens = torch.tensor([2560, 6000, 9000], dtype=torch.int32, device=device)
+
+    expected = _ref_paged_mqa_logits(
+        q, kv_cache, weights, lens, block_tables, max_model_len
+    )
+    out = torch.empty_like(expected)
+    actual = paged_mqa_logits_triton(
+        q, kv_cache, weights, lens, block_tables, max_model_len, out
+    )
+
+    assert torch.equal(torch.isinf(actual), torch.isinf(expected)), (
+        "masked region differs"
+    )
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=2e-2, rtol=2e-3)
+
+    production = fp8_paged_mqa_logits_torch(
+        q, kv_cache, weights, lens, block_tables, max_model_len
+    )
+    torch.testing.assert_close(
+        actual[finite], production[finite], atol=2e-2, rtol=2e-3
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_queries", [1, 4])
+def test_sparse_attn_decode_ragged_at_production_shapes(num_queries: int) -> None:
+    """Decode attention over a full top-k selection, at the deployed block size.
+
+    The other ragged-decode test uses block_size 4 with two selected rows per
+    query; deployment runs --block-size 256 and the indexer selects index_topk
+    512 rows, so the reduction the kernel actually performs is 256x longer than
+    anything covered.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1)
+    block_size, topk, heads, num_tokens = 256, 512, 32, 9216
+    main_use_fnuz = current_platform.is_fp8_fnuz()
+
+    q = torch.randn(
+        num_queries, heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    main_kv = torch.randn(
+        num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device
+    ) * 0.125
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, use_fnuz=main_use_fnuz)
+
+    g = torch.Generator(device="cpu").manual_seed(7)
+    main_rows = [
+        torch.randperm(num_tokens, generator=g)[:topk].sort().values.tolist()
+        for _ in range(num_queries)
+    ]
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    attn_sink = torch.randn(heads, dtype=torch.float32, device=device) * 0.25
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    expected = _ref_sparse_decode_ragged(
+        q=q,
+        main_cache=main_cache,
+        main_rows=main_rows,
+        scale=scale,
+        attn_sink=attn_sink,
+        block_size=block_size,
+        main_use_fnuz=main_use_fnuz,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_compute_global_topk_ragged_at_production_shapes() -> None:
+    """Top-k token indices to KV slots, at the deployed block size and width.
+
+    The other test for this runs at block_size 4 with four candidate columns.
+    Deployment uses --block-size 256 and index_topk 512, and a wrong slot here
+    points attention at the wrong tokens rather than failing loudly.
+    """
+    from vllm.models.deepseek_v4.amd.rocm import (
+        compute_global_topk_ragged_indices_and_indptr,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    block_size, topk, num_reqs, max_blocks = 256, 512, 4, 36
+    num_tokens = 8
+    seq_len = max_blocks * block_size
+
+    g = torch.Generator(device="cpu").manual_seed(11)
+    rows = []
+    for _ in range(num_tokens):
+        picked = torch.randperm(seq_len, generator=g)[:topk].sort().values
+        # A realistic row is partly padded once the context is shorter than topk.
+        pad = int(torch.randint(0, topk // 4, (1,), generator=g))
+        if pad:
+            picked[-pad:] = -1
+        rows.append(picked)
+    topk_indices = torch.stack(rows).to(torch.int32).to(device)
+
+    token_to_req_indices = (
+        torch.arange(num_tokens, dtype=torch.int32, device=device) % num_reqs
+    )
+    block_table = torch.arange(
+        num_reqs * max_blocks, dtype=torch.int32, device=device
+    ).reshape(num_reqs, max_blocks)
+    is_valid_token = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    is_valid_token[3] = False
+
+    actual_ragged, actual_indptr, actual_lens = (
+        compute_global_topk_ragged_indices_and_indptr(
+            topk_indices, token_to_req_indices, block_table, block_size,
+            is_valid_token,
+        )
+    )
+    expected_values, expected_positions, expected_indptr, expected_lens = (
+        _ref_global_topk_ragged(
+            topk_indices, token_to_req_indices, block_table, block_size,
+            is_valid_token,
+        )
+    )
+
+    torch.testing.assert_close(actual_ragged[expected_positions], expected_values)
+    torch.testing.assert_close(actual_indptr, expected_indptr)
+    torch.testing.assert_close(actual_lens, expected_lens)
+
+
+@torch.inference_mode()
+def test_canonicalise_topk_order_sorts_and_keeps_padding_last() -> None:
+    """Selected indices must reach the attention in a fixed order.
+
+    ``top_k_per_row_*`` returns the same set each call but not the same order,
+    and sparse attention sums over the selected keys, so the order sets the
+    rounding -- measured at 2.7% of the mean output magnitude between two
+    orderings of one selection, which is enough to change a generated token.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _canonicalise_topk_order,
+    )
+
+    device = torch.device("cuda")
+    g = torch.Generator(device="cpu").manual_seed(5)
+    topk = 512
+    picked = torch.randperm(9216, generator=g)[:topk]
+
+    # One selection, 64 slots unused, presented in two different orders.
+    valid = picked[: topk - 64]
+    pad = torch.full((64,), -1, dtype=valid.dtype)
+    rows = [
+        torch.cat([valid, pad]),
+        torch.cat([valid[torch.randperm(valid.numel(), generator=g)], pad]),
+    ]
+    buf = torch.stack(rows).to(torch.int32).to(device)
+
+    _canonicalise_topk_order(buf)
+
+    # Both orderings of one selection must land on the same row.
+    assert torch.equal(buf[0], buf[1])
+    valid = buf[0][buf[0] >= 0]
+    assert torch.equal(valid, valid.sort().values), "valid indices not ascending"
+    assert torch.all(buf[0][valid.numel():] == -1), "padding must sort last"
