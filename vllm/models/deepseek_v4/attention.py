@@ -404,6 +404,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         return qr_kv
 
+    def _kv_score_gemm(
+        self, hidden_states: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Project hidden states onto a compressor's fused wkv/wgate weight.
+
+        The compressor state cache is fp32, so this keeps the accumulator width
+        rather than rounding through the activation dtype.
+        """
+        return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
+
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
@@ -421,10 +431,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                return self._kv_score_gemm(
+                    hidden_states, compressor.fused_wkv_wgate.weight
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -438,10 +446,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                return self._kv_score_gemm(
+                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
                 )
 
             aux_fns[1] = indexer_weights_proj

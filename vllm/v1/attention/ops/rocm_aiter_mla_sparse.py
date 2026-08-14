@@ -1212,6 +1212,52 @@ def _get_cached_wo_a(
     return cached
 
 
+def _wo_a_project(o_ref: torch.Tensor, wo_a_weight: torch.Tensor) -> torch.Tensor:
+    """Contract ``[t, g, d]`` with ``[g, r, d]`` over d.
+
+    The batched GEMV the einsum lowers to runs well below memory bandwidth on
+    RDNA2 for short decode batches. Each group is already an ``[out, in]``
+    matrix, so the skinny GEMV can take them all in one grouped launch.
+
+    The group dimension is the kernel's second grid dimension rather than a
+    Python loop: at batch 1 the projection itself is smaller than the GPU's
+    kernel-to-kernel dispatch latency, so a launch per group cost more than the
+    work it did.
+
+    The batch bound is where the kernel stops staging the activation in LDS and
+    streams it from global instead, which costs about 2x. That is the launcher's
+    own condition, so it is spelled the same way here and tracks the reduction
+    dim instead of assuming one. Measured on the production shape
+    ``[t, 2, 4096] x [2, 1024, 4096]``, grouped against einsum: 4.24x at t=5,
+    3.40x at t=6, 1.55x at t=8, then 0.82x at t=9 once staging turns off.
+    Speculative decode verifies ``1 + num_speculative_tokens`` tokens at once,
+    so a bound that assumed one token per step handed this projection straight
+    back to the vendor GEMM.
+    """
+    from vllm import _custom_ops as ops
+    from vllm.platforms.rocm import (
+        GFX1030_SKINNY_GEMV_LDS_BYTES,
+        GFX1030_SKINNY_GEMV_MAX_TOKENS,
+        on_gfx1030,
+    )
+
+    num_tokens, num_groups, hidden = o_ref.shape
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1030()
+        and o_ref.dtype == wo_a_weight.dtype
+        and o_ref.dtype in (torch.float16, torch.bfloat16)
+        and hidden % 8 == 0
+        and 0 < num_tokens <= GFX1030_SKINNY_GEMV_MAX_TOKENS
+        and num_tokens * hidden * o_ref.element_size() <= GFX1030_SKINNY_GEMV_LDS_BYTES
+        and o_ref.stride(2) == 1
+        and wo_a_weight.stride(2) == 1
+    ):
+        return ops.wvSplitK_rdna2_grouped(wo_a_weight, o_ref)
+
+    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
@@ -1235,7 +1281,7 @@ def rocm_inv_rope_einsum(
         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1], o_ref.dtype
     )
 
-    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+    return _wo_a_project(o_ref, wo_a_weight)
 
 
 _DSV4_SPARSE_NOPE_DIM = 448
