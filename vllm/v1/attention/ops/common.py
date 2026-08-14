@@ -64,27 +64,56 @@ def dequant_fp8_ue8m0(
 ):
     """Decode UE8M0 block-scaled FP8 to fp32: ``fp8(x) * 2**(encoded_scale-127)``.
 
-    With ``FP8_BITOPS`` the e4m3 code is widened to fp16 with integer ops and
-    converted by v_cvt_f32_f16. The layouts are mantissa-aligned and every e4m3
-    subnormal is a normal fp16, so this is exact for every code; e4m3 NaN is not
-    preserved, which this cache never stores.
-
     The widening factor gets its own multiply. Folding it into the UE8M0
     exponent saves an op but overflows for large scales and denormalises the
     intermediate for small ones.
     """
+    return widen_fp8(x_uint8, USE_FNUZ, FP8_BITOPS) * tl.exp2(
+        encoded_scale.to(tl.float32) - 127.0
+    )
+
+
+@triton.jit
+def widen_fp8_to_f16(x_uint8):
+    """Widen raw FP8 bytes to fp16, scaled by ``WIDEN_FP8_F16_SCALE``.
+
+    Mantissa-aligning e4m3 into fp16 leaves the value a fixed power of two too
+    small; callers fold that constant into a later multiply rather than paying
+    a convert here. Keeping operands in fp16 is what lets ``tl.dot`` lower to
+    RDNA2's V_DOT2_F32_F16, which retires two MACs per instruction where fp32
+    would issue two separate v_fmac_f32.
+
+    Exact for every e4m3 code: the smallest, ``2**-9``, lands on ``2**-17``,
+    which fp16 still represents (subnormally), so nothing is lost provided
+    half-precision denormals are not flushed.
+    """
+    bits = x_uint8.to(tl.uint16)
+    bits = ((bits & 0x80) << 8) | ((bits & 0x7F) << 7)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def widen_fp8(
+    x_uint8,
+    USE_FNUZ: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
+):
+    """Widen raw FP8 bytes to fp32, applying no scale.
+
+    With ``FP8_BITOPS`` the e4m3 code is widened to fp16 with integer ops and
+    converted by v_cvt_f32_f16. The layouts are mantissa-aligned and every e4m3
+    subnormal is a normal fp16, so this is exact for every code; e4m3 NaN is not
+    preserved, which these caches never store.
+    """
     if FP8_BITOPS:
         bits = x_uint8.to(tl.uint16)
         bits = ((bits & 0x80) << 8) | ((bits & 0x7F) << 7)
-        widened = bits.to(tl.float16, bitcast=True).to(tl.float32) * (
+        return bits.to(tl.float16, bitcast=True).to(tl.float32) * (
             128.0 if USE_FNUZ else 256.0
         )
-        return widened * tl.exp2(encoded_scale.to(tl.float32) - 127.0)
     if USE_FNUZ:
-        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-    else:
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-    return x_fp8.to(tl.float32) * tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+        return x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+    return x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
 
 @triton.jit

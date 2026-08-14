@@ -21,12 +21,14 @@ from vllm.v1.attention.ops.common import (
     quant_fp8_to_uint8,
     unpack_seq_triton,
     use_fp8_bitops_decode,
+    widen_fp8,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    from vllm.platforms.rocm import _ON_GFX1030, _ON_GFX942, _ON_GFX950
 else:
+    _ON_GFX1030 = False
     _ON_GFX942 = False
     _ON_GFX950 = False
 
@@ -482,6 +484,28 @@ def paged_mqa_logits_module():
     return None
 
 
+def paged_mqa_logits_workspace_shape(
+    num_heads: int, num_tokens: int, max_model_len: int
+) -> tuple[int, ...]:
+    """Workspace ``rocm_fp8_paged_mqa_logits`` claims.
+
+    The AITER kernel off gfx942/950 writes per-head logits it reduces
+    afterwards; every other path writes the reduced logits straight out. Both
+    the call and the profiling reservation take the shape from here so they
+    cannot disagree.
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    aiter_per_head = (
+        rocm_aiter_ops.is_enabled()
+        and paged_mqa_logits_module() is not None
+        and not (_ON_GFX942 or _ON_GFX950)
+    )
+    if aiter_per_head:
+        return (num_heads, num_tokens, max_model_len)
+    return (num_tokens, max_model_len)
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -528,8 +552,11 @@ def rocm_fp8_paged_mqa_logits(
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
             batch_size, next_n, heads, _ = q_fp8.shape
+            shape = paged_mqa_logits_workspace_shape(
+                heads, batch_size * next_n, max_model_len
+            )
             (out_logits,) = current_workspace_manager().get_simultaneous(
-                ((batch_size * next_n, max_model_len), torch.float32),
+                (shape, torch.float32),
             )
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
@@ -550,8 +577,11 @@ def rocm_fp8_paged_mqa_logits(
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
         batch_size, next_n, heads, _ = q_fp8.shape
+        shape = paged_mqa_logits_workspace_shape(
+            heads, batch_size * next_n, max_model_len
+        )
         (out_qk,) = current_workspace_manager().get_simultaneous(
-            ((heads, batch_size * next_n, max_model_len), torch.float32),
+            (shape, torch.float32),
         )
         out_qk.fill_(float("-inf"))
         deepgemm_fp8_paged_mqa_logits_stage1(
@@ -565,10 +595,160 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
+    batch_size, next_n, heads, _ = q_fp8.shape
+    shape = paged_mqa_logits_workspace_shape(heads, batch_size * next_n, max_model_len)
+    (out,) = current_workspace_manager().get_simultaneous((shape, torch.float32))
+    return paged_mqa_logits_triton(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        out,
+    )
+
+
+@triton.jit
+def _paged_mqa_logits_kernel(
+    q_ptr,  # [num_tokens, heads, head_dim] fp8 bytes
+    kv_cache_ptr,  # [num_blocks, block_size * (head_dim + 4)] bytes
+    weights_ptr,  # [num_tokens, heads]
+    context_lens_ptr,
+    block_tables_ptr,  # [batch, max_blocks]
+    out_ptr,  # [num_tokens, max_model_len]
+    block_table_stride,
+    kv_block_stride,
+    out_stride,
+    max_model_len,
+    max_blocks,
+    NEXT_N: tl.constexpr,
+    PER_POSITION_LENS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+    FP8_BITOPS: tl.constexpr,
+):
+    token = tl.program_id(0)
+    blk = tl.program_id(1)
+    batch = token // NEXT_N
+
+    n = blk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    in_range = n < max_model_len
+    neg_inf = float("-inf")
+
+    # Last key this query may attend to. A draft block of NEXT_N queries walks
+    # the final NEXT_N positions, so each one sees a prefix of the context.
+    if PER_POSITION_LENS:
+        last = tl.load(context_lens_ptr + token) - 1
     else:
-        return fp8_paged_mqa_logits_torch(
-            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
-        )
+        last = tl.load(context_lens_ptr + batch) - NEXT_N + (token % NEXT_N)
+
+    out_row = out_ptr + token * out_stride + n
+    if blk >= max_blocks or blk * BLOCK_SIZE > last:
+        tl.store(out_row, neg_inf, mask=in_range)
+        return
+
+    block_id = tl.load(block_tables_ptr + batch * block_table_stride + blk)
+    if block_id < 0:
+        tl.store(out_row, neg_inf, mask=in_range)
+        return
+
+    offs_t = tl.arange(0, BLOCK_SIZE)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_h = tl.arange(0, HEADS)
+    valid = in_range & (n <= last)
+
+    # Each block holds BLOCK_SIZE fp8 rows followed by one fp32 scale per row.
+    # The block stride is large enough to leave 32-bit range.
+    block_base = block_id.to(tl.int64) * kv_block_stride
+    k = widen_fp8(
+        tl.load(
+            kv_cache_ptr + block_base + offs_t[:, None] * HEAD_DIM + offs_d[None, :],
+            mask=valid[:, None],
+            other=0,
+        ),
+        IS_FNUZ,
+        FP8_BITOPS,
+    ).to(tl.float16)
+    scale_ptr = (kv_cache_ptr + block_base + BLOCK_SIZE * HEAD_DIM).to(
+        tl.pointer_type(tl.float32)
+    )
+    k_scale = tl.load(scale_ptr + offs_t, mask=valid, other=0.0)
+
+    q = widen_fp8(
+        tl.load(
+            q_ptr
+            + token * HEADS * HEAD_DIM
+            + offs_h[:, None] * HEAD_DIM
+            + offs_d[None, :]
+        ),
+        IS_FNUZ,
+        FP8_BITOPS,
+    ).to(tl.float16)
+
+    # scores[n, h] = k[n] . q[h]. The head weights fold in before the reduction
+    # and the per-key cache scale after it, which is what the reference does.
+    scores = tl.maximum(tl.dot(k, tl.trans(q)), 0.0)
+    w = tl.load(weights_ptr + token * HEADS + offs_h)
+    logits = tl.sum(scores * w[None, :], axis=1) * k_scale
+
+    tl.store(out_row, tl.where(valid, logits, neg_inf), mask=in_range)
+
+
+def paged_mqa_logits_triton(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Paged MQA logits without a host round trip.
+
+    The torch reference reads each sequence length back to the host to size its
+    slices, which cannot run inside a graph capture and serialises the batch.
+    Here the lengths stay on the device and bound the work by masking, so the
+    launch shape depends only on the configured maximum. ``out`` is written in
+    full, including the ``-inf`` beyond each context.
+    """
+    batch_size, next_n, heads, head_dim = q_fp8.shape
+    block_size = kv_cache_fp8.shape[1]
+    num_tokens = batch_size * next_n
+
+    # A 2-D length carries its own limit per draft position; a 1-D one is per
+    # sequence and the kernel derives each position's limit from it.
+    per_position_lens = context_lens.dim() > 1 and context_lens.shape[-1] == next_n
+    lens = context_lens.reshape(-1)
+
+    grid = (num_tokens, triton.cdiv(max_model_len, block_size))
+    # The cache is a strided view into the shared KV pool, so a block's rows are
+    # contiguous but consecutive blocks are not: take the row stride from the
+    # tensor rather than assuming the packed block_size * (head_dim + 4).
+    kv_flat = kv_cache_fp8.view(torch.uint8).view(kv_cache_fp8.shape[0], -1)
+    _paged_mqa_logits_kernel[grid](
+        q_fp8.view(torch.uint8),
+        kv_flat,
+        weights,
+        lens,
+        block_tables,
+        out,
+        block_tables.stride(0),
+        kv_flat.stride(0),
+        out.stride(0),
+        max_model_len,
+        block_tables.shape[1],
+        NEXT_N=next_n,
+        PER_POSITION_LENS=per_position_lens,
+        BLOCK_SIZE=block_size,
+        HEADS=heads,
+        HEAD_DIM=head_dim,
+        IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
+        FP8_BITOPS=use_fp8_bitops_decode(),
+    )
+    return out
 
 
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
@@ -676,6 +856,17 @@ def rocm_fp8_mqa_logits(
             q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
         )
 
+    # RDNA2 never gets an AITER kernel for this, and the reference below is
+    # quadratic in the sequence length, so route it to the Triton kernel.
+    if _ON_GFX1030:
+        from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
+            fp8_mqa_logits_gfx1030,
+        )
+
+        return fp8_mqa_logits_gfx1030(
+            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
+
     aiter_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
         aiter_mqa_logits_module = mqa_logits_module()
@@ -685,6 +876,30 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     else:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+
+
+def _canonicalise_topk_order(topk_indices: torch.Tensor) -> None:
+    """Sort each row's selected indices ascending, in place, padding last.
+
+    ``top_k_per_row_*`` returns the same *set* every time but not the same
+    order, and the sparse attention that consumes it sums over the selected
+    keys, so the order decides the rounding. Measured on RDNA2 that is 2.7% of
+    the mean output magnitude between two orderings of one selection -- enough
+    to change a generated token, which made greedy decoding answer an identical
+    prompt differently once a prompt passed the 2048 tokens that engage the
+    indexer.
+
+    Ascending order is also what ``_fill_short_context_topk_indices`` writes for
+    contexts below that boundary, so this makes the two paths agree, and it
+    gathers the KV cache in address order rather than at random.
+
+    ``-1`` marks an unused slot and must stay at the end of the row, so it sorts
+    as the largest key rather than the smallest.
+    """
+    sentinel = torch.iinfo(torch.int32).max
+    keyed = torch.where(topk_indices < 0, sentinel, topk_indices)
+    ordered = keyed.sort(dim=-1).values
+    topk_indices.copy_(torch.where(ordered == sentinel, -1, ordered))
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
@@ -747,17 +962,14 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
-        if _ON_GFX942 or _ON_GFX950:
-            workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
-            )
-        else:
-            workspace_manager.get_simultaneous(
-                (
-                    (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
-                    torch.float32,
+        workspace_manager.get_simultaneous(
+            (
+                paged_mqa_logits_workspace_shape(
+                    q_fp8.shape[1], hidden_states.shape[0], max_model_len
                 ),
-            )
+                torch.float32,
+            ),
+        )
         # Transient logits tensor peak memory, produced by
         # rocm_fp8_mqa_logits (prefill) and rocm_fp8_paged_mqa_logits
         # (decode). Prefill logits are bounded by
@@ -853,6 +1065,7 @@ def rocm_aiter_sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            _canonicalise_topk_order(topk_indices)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -902,6 +1115,7 @@ def rocm_aiter_sparse_attn_indexer(
             logits.stride(1),
             topk_tokens,
         )
+        _canonicalise_topk_order(topk_indices)
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

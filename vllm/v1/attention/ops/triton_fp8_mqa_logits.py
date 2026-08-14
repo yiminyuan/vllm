@@ -13,6 +13,14 @@ ROCm/aiter#3257 bugfix for gfx942.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.common import widen_fp8_to_f16
+
+# RDNA2 has no FP8 matrix core and no FP8 convert, so the gfx942 kernel above --
+# which feeds FP8 operands straight to tl.dot -- cannot run there. The variant
+# below widens the raw FP8 bytes with integer ops and multiplies in fp32.
+# BLOCK_KV stays modest because the scores tile is [NUM_HEADS, BLOCK_KV] fp32
+# and RDNA2 allocates 64 KiB of LDS per workgroup.
+_GFX1030_WG_LDS_BYTES = 64 * 1024
 
 # gfx942 (MI300X) has 64 KiB of LDS per CU. We accept the default
 # (BLOCK_KV=128, num_stages=2) tile only when *both* of these hold:
@@ -259,4 +267,180 @@ def fp8_mqa_logits_gfx942(
         matrix_instr_nonkdim=matrix_instr_nonkdim,
     )
 
+    return logits
+
+
+@triton.jit
+def _fp8_mqa_logits_rdna2_kernel(
+    Q_ptr,  # uint8 view of fp8e4m3 [seq_len, H, D]
+    KV_ptr,  # uint8 view of fp8e4m3 [seq_len_kv, D]
+    kv_scales_ptr,  # fp32 [seq_len_kv]
+    weights_ptr,  # fp32 [seq_len, H]
+    cu_start_ptr,  # int32 [seq_len]
+    cu_end_ptr,  # int32 [seq_len]
+    logits_ptr,  # fp32 [seq_len, seq_len_kv]
+    seq_len,
+    seq_len_kv,
+    NUM_HEADS: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    stride_q_s: tl.int64,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_kv_s: tl.int64,
+    stride_kv_d: tl.constexpr,
+    stride_w_s: tl.int64,
+    stride_w_h: tl.constexpr,
+    stride_logits_s: tl.int64,
+    stride_logits_k: tl.int64,
+    BLOCK_KV: tl.constexpr,
+    WIDEN_SCALE: tl.constexpr,
+):
+    """One program per query row; mirrors the gfx942 kernel's arithmetic."""
+    row_id = tl.program_id(0)
+    # Descend so the longest rows start first and the tail is short.
+    row_id = tl.num_programs(0) - row_id - 1
+    tl.assume(row_id >= 0)
+
+    logits_row_ptrs = logits_ptr + row_id * stride_logits_s
+    h_inds = tl.arange(0, NUM_HEADS)[:, None]
+    d_inds = tl.arange(0, HEAD_SIZE)
+
+    q_ptrs = (
+        Q_ptr + row_id * stride_q_s + h_inds * stride_q_h + d_inds[None, :] * stride_q_d
+    )
+    q_block = widen_fp8_to_f16(tl.load(q_ptrs, cache_modifier=".cg"))
+
+    w_ptrs = weights_ptr + row_id * stride_w_s + h_inds * stride_w_h
+    w_block = tl.load(w_ptrs, cache_modifier=".cg").to(tl.float32)
+
+    start_ind = tl.maximum(tl.load(cu_start_ptr + row_id), 0)
+    end_ind = tl.minimum(tl.load(cu_end_ptr + row_id), seq_len_kv)
+    shifted_unmasked_end = (end_ind - start_ind) // BLOCK_KV * BLOCK_KV
+
+    kv_col_offsets = tl.arange(0, BLOCK_KV) + start_ind
+    kv_ptrs = (
+        KV_ptr + kv_col_offsets[None, :] * stride_kv_s + d_inds[:, None] * stride_kv_d
+    )
+    kv_scales_ptrs = kv_scales_ptr + kv_col_offsets
+    logits_ptrs = logits_row_ptrs + kv_col_offsets * stride_logits_k
+
+    for _ in tl.range(0, shifted_unmasked_end, BLOCK_KV):
+        kv_block = widen_fp8_to_f16(tl.load(kv_ptrs))
+        kv_scales = tl.load(kv_scales_ptrs)
+
+        # fp16 operands, fp32 accumulate -> V_DOT2_F32_F16 on RDNA2. Both
+        # operands carry the widening factor, so undo it once, folded into
+        # the per-KV scale multiply that has to happen anyway.
+        scores = tl.dot(q_block, kv_block, out_dtype=tl.float32)
+        scores = scores * (kv_scales[None, :] * (WIDEN_SCALE * WIDEN_SCALE))
+        scores = tl.maximum(scores, 0.0)
+        scores = scores * w_block
+        tl.store(logits_ptrs, tl.sum(scores, axis=0))
+
+        kv_ptrs += BLOCK_KV * stride_kv_s
+        kv_scales_ptrs += BLOCK_KV
+        logits_ptrs += BLOCK_KV * stride_logits_k
+        kv_col_offsets += BLOCK_KV
+
+    kv_col_mask = kv_col_offsets < end_ind
+    kv_block = widen_fp8_to_f16(
+        tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0)
+    )
+    kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
+
+    scores = tl.dot(q_block, kv_block, out_dtype=tl.float32)
+    scores = scores * (kv_scales[None, :] * (WIDEN_SCALE * WIDEN_SCALE))
+    scores = tl.maximum(scores, 0.0)
+    scores = scores * w_block
+    in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
+    tl.store(logits_ptrs, tl.sum(scores, axis=0), mask=in_window)
+
+
+def _gfx1030_tile(num_heads: int, head_size: int) -> int:
+    """Largest BLOCK_KV whose live tiles stay inside one workgroup's LDS.
+
+    Counted conservatively: the widened KV tile, the fp32 scores tile and the
+    widened Q tile, even though Triton keeps Q and the accumulator in registers
+    on this target. Overestimating only shrinks the tile; underestimating costs
+    a JIT abort.
+    """
+    for block_kv in (128, 64, 32, 16):
+        kv_bytes = head_size * block_kv * 2
+        scores_bytes = num_heads * block_kv * 4
+        q_bytes = num_heads * head_size * 2
+        if q_bytes + kv_bytes + scores_bytes <= _GFX1030_WG_LDS_BYTES:
+            return block_kv
+    return 16
+
+
+def fp8_mqa_logits_gfx1030(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Compute FP8 MQA logits on RDNA2 (gfx1030).
+
+    Same contract as ``fp8_mqa_logits_gfx942``: logits are ``[M, N]`` fp32 and
+    positions outside ``[cu_starts[i], cu_ends[i])`` read ``-inf`` so the
+    caller can top-k without masking. Replaces a dense reference that
+    materialises an ``[H, M, N]`` fp32 tensor and is quadratic in the sequence.
+    """
+    from vllm.platforms import current_platform
+
+    seq_len, num_heads, head_size = q.shape
+    seq_len_kv = k_fp8.shape[0]
+    assert num_heads & (num_heads - 1) == 0, (
+        f"num_heads must be a power of two (got {num_heads})"
+    )
+    assert head_size & (head_size - 1) == 0, (
+        f"head_size must be a power of two (got {head_size})"
+    )
+
+    logits = torch.full(
+        (seq_len, seq_len_kv),
+        fill_value=-float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if seq_len == 0 or seq_len_kv == 0:
+        return logits
+
+    q_bytes = q.view(torch.uint8)
+    kv_bytes = k_fp8.view(torch.uint8)
+    stride_q_s, stride_q_h, stride_q_d = q_bytes.stride()
+    stride_kv_s, stride_kv_d = kv_bytes.stride()
+    stride_w_s, stride_w_h = weights.stride()
+    stride_logits_s, stride_logits_k = logits.stride()
+
+    _fp8_mqa_logits_rdna2_kernel[(seq_len,)](
+        Q_ptr=q_bytes,
+        KV_ptr=kv_bytes,
+        kv_scales_ptr=kv_scales.reshape(-1),
+        weights_ptr=weights,
+        cu_start_ptr=cu_starts,
+        cu_end_ptr=cu_ends,
+        logits_ptr=logits,
+        seq_len=seq_len,
+        seq_len_kv=seq_len_kv,
+        NUM_HEADS=num_heads,
+        HEAD_SIZE=head_size,
+        stride_q_s=stride_q_s,
+        stride_q_h=stride_q_h,
+        stride_q_d=stride_q_d,
+        stride_kv_s=stride_kv_s,
+        stride_kv_d=stride_kv_d,
+        stride_w_s=stride_w_s,
+        stride_w_h=stride_w_h,
+        stride_logits_s=stride_logits_s,
+        stride_logits_k=stride_logits_k,
+        BLOCK_KV=_gfx1030_tile(num_heads, head_size),
+        WIDEN_SCALE=(
+            128.0 if current_platform.fp8_dtype() == torch.float8_e4m3fnuz else 256.0
+        ),
+        num_warps=4,
+        waves_per_eu=2,
+    )
     return logits
