@@ -407,9 +407,9 @@ def test_paged_mqa_logits_triton_matches_reference(
 
     The production torch path reads each length back to the host, which cannot
     run under a graph capture, so this kernel takes over decode; the two have to
-    agree everywhere including the -inf beyond each context. For a single query
-    per sequence the production path is checked too, which is the case that runs
-    today.
+    agree everywhere including the -inf beyond each context. The torch path is
+    checked at every query count, since more than one query per sequence is the
+    shape speculative decoding produces.
     """
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         fp8_paged_mqa_logits_torch,
@@ -452,13 +452,12 @@ def test_paged_mqa_logits_triton_matches_reference(
     finite = ~torch.isinf(expected)
     torch.testing.assert_close(actual[finite], expected[finite], atol=2e-2, rtol=2e-3)
 
-    if next_n == 1:
-        production = fp8_paged_mqa_logits_torch(
-            q, kv_cache, weights, context_lens, block_tables, max_model_len
-        )
-        torch.testing.assert_close(
-            actual[finite], production[finite], atol=2e-2, rtol=2e-3
-        )
+    production = fp8_paged_mqa_logits_torch(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+    torch.testing.assert_close(
+        actual[finite], production[finite], atol=2e-2, rtol=2e-3
+    )
 
 
 @torch.inference_mode()
