@@ -414,11 +414,26 @@ def fp8_paged_mqa_logits_torch(
             logits[i, :seq_len] = score[:seq_len]
         return logits
 
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
-    scale = scale.contiguous().view(torch.float)
+    # A block stores every fp8 row first and then every fp32 scale, so values
+    # and scales split at the block boundary. Slicing the last axis instead
+    # reads each row as if it carried its own trailing scale.
+    block_size = kv_cache.shape[1]
+    scale_offset = block_size * dim
+    kv_flat = kv_cache.reshape(kv_cache.shape[0], -1)
+    values = (
+        kv_flat[..., :scale_offset]
+        .view(dtype=fp8_dtype)
+        .to(torch.float32)
+        .view(-1, block_size, dim)
+    )
+    scales = (
+        kv_flat[..., scale_offset:]
+        .contiguous()
+        .view(dtype=torch.float32)
+        .view(-1, block_size, 1)
+    )
     q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
-    num_block, block_size, _, dim = kv_cache.size()
+    kv_cache = (values * scales).unsqueeze(2)
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
