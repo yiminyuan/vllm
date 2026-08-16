@@ -2253,6 +2253,18 @@ def wvSplitK_rdna2_grouped(
     return torch.ops._rocm_C.wvSplitK_rdna2_grouped(a, b, out)
 
 
+def mhc_proj_rdna2(
+    x: torch.Tensor, fn: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """mHC pre-block projection: (mixes[T, N] fp32, sqrsum[T] fp32).
+
+    ``x`` is the fp16/bf16 residual flattened to [T, hc_mult * hidden_size] and
+    ``fn`` the fp32 [hc_mult3, K] mixing weight. Widening is exact and happens
+    in-register, so no fp32 copy of the residual is materialised.
+    """
+    return torch.ops._rocm_C.mhc_proj_rdna2(x, fn)
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,
