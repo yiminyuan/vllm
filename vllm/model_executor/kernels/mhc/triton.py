@@ -294,6 +294,48 @@ def _mhc_proj(x_f32: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
     return partials.sum(0)
 
 
+# nout values csrc/rocm/mhc_proj_rdna2.cu instantiates; anything else takes the
+# portable path. nout is 2*hc_mult + hc_mult**2, so these are hc_mult 2 and 4.
+_RDNA2_MHC_PROJ_NOUT = (8, 24)
+
+
+def _mhc_cast_and_proj(x_flat: Tensor, fn: Tensor) -> tuple[Tensor, Tensor]:
+    """Widen the residual, project it onto ``fn``, and reduce its squares.
+
+    The portable path materialises the whole fp32 residual because the vendor
+    GEMM needs it as an operand. On RDNA2 the fused kernel widens in-register
+    instead -- exactly, since fp16 and bf16 both convert to fp32 losslessly --
+    which is worth more than the projection itself: the copy is 2x the residual
+    written and read back.
+    """
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1030
+
+        if (
+            on_gfx1030()
+            and fn.shape[0] in _RDNA2_MHC_PROJ_NOUT
+            and x_flat.dtype in (torch.float16, torch.bfloat16)
+            and x_flat.shape[1] % 8 == 0
+            and x_flat.is_contiguous()
+            and fn.is_contiguous()
+        ):
+            from vllm import _custom_ops as ops
+
+            return ops.mhc_proj_rdna2(x_flat, fn)
+
+    num_tokens, k = x_flat.shape
+    x_f32 = torch.empty((num_tokens, k), dtype=torch.float32, device=x_flat.device)
+    sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=x_flat.device)
+    _cast_and_sqrsum_kernel[(num_tokens,)](
+        x_flat, x_f32, sqrsum, k, BLOCK_K=1024, num_warps=4
+    )
+    mixes = _mhc_proj(x_f32, fn)
+    del x_f32
+    return mixes, sqrsum
+
+
 @triton.jit
 def _mhc_mix_kernel(
     mixes_ptr,  # [T, n_out] fp32, raw projection
@@ -402,8 +444,9 @@ def _mhc_pre_triton(
     Same arithmetic as the torch reference, minus two full passes over the
     residual: the fp32 widening carries the sum of squares with it, and the
     ``pre_mix``-weighted reduction runs in one kernel instead of materialising
-    another fp32 copy. The projection itself stays on the vendor GEMM, which
-    beats a Triton dot on architectures without matrix cores.
+    another fp32 copy. The projection stays on the vendor GEMM, which beats a
+    Triton dot on architectures without matrix cores, except where a native
+    kernel exists -- see ``_mhc_cast_and_proj``.
     """
     hc_mult, hidden_size = residual.shape[-2:]
     x = residual.reshape(-1, hc_mult, hidden_size)
@@ -412,14 +455,8 @@ def _mhc_pre_triton(
         return
     k = hc_mult * hidden_size
 
-    x_f32 = torch.empty((num_tokens, k), dtype=torch.float32, device=x.device)
-    sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=x.device)
-    _cast_and_sqrsum_kernel[(num_tokens,)](
-        x.reshape(num_tokens, k), x_f32, sqrsum, k, BLOCK_K=1024, num_warps=4
-    )
-
-    mixes = _mhc_proj(x_f32, fn)
-    del x_f32
+    x_flat = x.reshape(num_tokens, k)
+    mixes, sqrsum = _mhc_cast_and_proj(x_flat, fn)
 
     block_m = triton.next_power_of_2(hc_mult)
     inv_k = 1.0 / k

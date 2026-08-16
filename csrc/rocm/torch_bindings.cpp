@@ -82,6 +82,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "wvSplitK_rdna2_grouped(Tensor in_a, Tensor in_b, Tensor(a!)? out) "
       "-> Tensor");
   rocm_ops.impl("wvSplitK_rdna2_grouped", torch::kCUDA, &wvSplitK_rdna2_grouped);
+
+  // mHC pre-block projection + sum of squares, fused so the fp32 widening of
+  // the residual never reaches memory.
+  rocm_ops.def("mhc_proj_rdna2(Tensor x, Tensor fn) -> (Tensor, Tensor)");
+  rocm_ops.impl("mhc_proj_rdna2", torch::kCUDA, &mhc_proj_rdna2);
 #endif
 
 #ifdef VLLM_ROCM_GFX1100

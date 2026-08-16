@@ -44,6 +44,9 @@ torch::Tensor wvSplitK_rdna2_grouped(const at::Tensor& in_a,
                                      const at::Tensor& in_b,
                                      const std::optional<at::Tensor>& out_opt);
 
+std::tuple<torch::Tensor, torch::Tensor> mhc_proj_rdna2(const at::Tensor& x,
+                                                        const at::Tensor& fn);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);
