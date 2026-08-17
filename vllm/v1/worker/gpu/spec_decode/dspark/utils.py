@@ -4,8 +4,8 @@
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -52,9 +52,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
-
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
@@ -68,6 +65,16 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     if target_embed is not None and _should_share(
         draft_model, "has_own_embed_tokens", draft_embed, target_embed
     ):
+        # Under pipeline parallelism the target's embedding is a PPMissingLayer
+        # on every rank but the first, so the drafter would silently embed with
+        # uninitialized weights. spec_decode_needs_target_embed() gives the last
+        # rank a real one; refuse rather than draft garbage if it did not.
+        if isinstance(target_embed, PPMissingLayer):
+            raise RuntimeError(
+                "The DSpark drafter needs the target's embed_tokens, but this "
+                "pipeline stage only has a placeholder. The last stage must "
+                "instantiate it (see spec_decode_needs_target_embed)."
+            )
         if draft_embed is not None:
             del draft_inner.embed_tokens
         draft_inner.embed_tokens = target_embed

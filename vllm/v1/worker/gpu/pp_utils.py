@@ -20,7 +20,8 @@ class PendingRecv:
 
     event: torch.cuda.Event
 
-    sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
+    # [num_reqs, max_sample_len + draft_token_width]
+    token_payload: torch.Tensor
     num_sampled: torch.Tensor  # [num_reqs]
     num_rejected: torch.Tensor  # [num_reqs]
     idx_mapping: torch.Tensor  # [num_reqs]
@@ -60,11 +61,21 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        sync_draft_tokens: bool = False,
     ):
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
+        # Proposal runs only on the last rank, so the next step's draft tokens
+        # ride this broadcast rather than a second collective. Both sides must
+        # size the payload identically: the sampler emits one column when there
+        # were no draft tokens to verify and max_sample_len columns otherwise,
+        # so the width is pinned here rather than taken from the sampler output.
+        self.draft_token_width = num_speculative_steps if sync_draft_tokens else 0
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
@@ -116,12 +127,36 @@ class PPHandler:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
-        return dict(
-            sampled_tokens=slot.sampled_tokens,
+        outputs = dict(
+            sampled_tokens=slot.token_payload[:, : self.max_sample_len],
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
         )
+        if self.draft_token_width:
+            draft_tokens = slot.token_payload[:, self.max_sample_len :]
+            draft_idx_mapping = slot.idx_mapping
+            if exclude_mask.any():
+                # This slot is consumed pp_size steps after it was received, and
+                # a request can finish in that window and have its state index
+                # handed to a new request. Restoring through the unfiltered
+                # mapping would write the finished request's drafts into whoever
+                # owns the index now, so scatter only the still-valid rows.
+                valid_rows = np.flatnonzero(~exclude_mask)
+                # int32 to match idx_mapping, so both restore paths index the
+                # same way.
+                update_indices = np.stack(
+                    (valid_rows, slot.idx_mapping_np[valid_rows])
+                ).astype(np.int32)
+                draft_rows, draft_idx_mapping = async_copy_to_gpu(
+                    update_indices, device=self.device
+                ).unbind(dim=0)
+                draft_tokens = draft_tokens.index_select(0, draft_rows)
+            outputs.update(
+                draft_tokens=draft_tokens,
+                draft_idx_mapping=draft_idx_mapping,
+            )
+        return outputs
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
@@ -139,12 +174,15 @@ class PPHandler:
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            sampled_tokens = torch.empty(
-                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+            token_payload = torch.empty(
+                num_reqs,
+                self.max_sample_len + self.draft_token_width,
+                dtype=torch.int64,
+                device=self.device,
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
             torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
+                token_payload, src=self.last_rank, group=self.broadcast_group
             )
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
@@ -153,11 +191,11 @@ class PPHandler:
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
-            sampled_tokens.record_stream(self.main_stream)
+            token_payload.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
-            sampled_tokens,
+            token_payload,
             num_sampled,
             num_rejected,
             input_batch.idx_mapping,
@@ -173,6 +211,7 @@ class PPHandler:
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         input_batch: InputBatch,
+        draft_token_ids: torch.Tensor | None = None,
     ) -> None:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
@@ -181,13 +220,30 @@ class PPHandler:
 
         assert sampled_token_ids.dtype == torch.int64
 
+        # `receive` always allocates max_sample_len (+ draft) columns, but the
+        # sampler returns a single column whenever there were no draft tokens to
+        # verify -- during warmup, for instance. Broadcasting that narrower
+        # tensor makes the two sides disagree on the element count and the
+        # collective never completes, so normalise to the agreed width here.
+        token_payload = sampled_token_ids.new_zeros(
+            sampled_token_ids.shape[0],
+            self.max_sample_len + self.draft_token_width,
+        )
+        num_cols = min(sampled_token_ids.shape[1], self.max_sample_len)
+        token_payload[:, :num_cols].copy_(sampled_token_ids[:, :num_cols])
+        if self.draft_token_width:
+            assert draft_token_ids is not None
+            token_payload[:, self.max_sample_len :].copy_(draft_token_ids)
+        else:
+            assert draft_token_ids is None
+
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
-                sampled_token_ids.contiguous(),
+                token_payload,
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
@@ -195,5 +251,5 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
-            for tensor in (sampled_token_ids, num_sampled, num_rejected):
+            for tensor in (token_payload, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

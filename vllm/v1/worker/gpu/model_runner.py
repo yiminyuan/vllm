@@ -134,7 +134,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    aux_pp_relay_keys,
     set_eagle3_aux_hidden_state_layers,
+    supports_aux_hidden_states_over_pp,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -237,7 +239,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
+        # Aux slots this stage receives and must pass on; filled in load_model.
+        self.aux_pp_relay_keys: tuple[str, ...] = ()
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # Proposal runs only on the last rank; the other ranks must be handed
+        # the resulting drafts or they rebuild a different verification input.
+        self.sync_draft_tokens_across_pp = (
+            self.use_pp and self.speculative_config is not None
+        )
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -245,11 +254,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -293,6 +297,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                sync_draft_tokens=self.sync_draft_tokens_across_pp,
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -368,6 +373,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.use_pp:
+                    if not supports_aux_hidden_states_over_pp(self.model):
+                        raise ValueError(
+                            f"{self.speculative_config.method} with pipeline "
+                            f"parallel is not supported by "
+                            f"{type(self.model).__name__}: it does not forward "
+                            "auxiliary hidden states across pipeline stages."
+                        )
+                    self.aux_pp_relay_keys = aux_pp_relay_keys(self.model)
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
@@ -1371,6 +1385,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        draft_tokens: torch.Tensor | None = None,
+        draft_idx_mapping: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1394,6 +1410,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
+
+        if draft_tokens is not None:
+            # Restored alongside the matching sampled tokens so the next step is
+            # built from the drafts the last rank actually proposed. Indexed the
+            # same way as the last rank's own write below; idx_mapping is int32,
+            # which index_copy_ rejects.
+            assert draft_idx_mapping is not None
+            self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+        else:
+            assert draft_idx_mapping is None
 
     def _merge_ec_connector_no_forward(
         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
@@ -1699,6 +1725,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            if self.aux_pp_relay_keys:
+                # The forward packs only this stage's taps, so the ones received
+                # from earlier stages have to be passed along explicitly.
+                received = model_inputs["intermediate_tensors"]
+                assert output_intermediate_tensors is not None
+                output_intermediate_tensors = IntermediateTensors(
+                    output_intermediate_tensors.tensors
+                    | {k: received[k] for k in self.aux_pp_relay_keys}
+                )
             return output_intermediate_tensors
         return None
 
@@ -1750,8 +1785,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, input_batch, grammar_output
         )
 
-        if self.pp_handler is not None:
+        if self.pp_handler is not None and not self.sync_draft_tokens_across_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+            # When drafts must travel too, this is deferred until after propose
+            # so both ride one collective.
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
                 num_sampled,
@@ -1843,6 +1880,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
+                )
+
+            if self.sync_draft_tokens_across_pp:
+                # Deferred until here so the sampled tokens and the drafts the
+                # other ranks must verify next step ride one collective.
+                assert self.pp_handler is not None
+                self.pp_handler.broadcast(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch,
+                    draft_tokens,
                 )
 
         if self.num_speculative_steps > 0:
