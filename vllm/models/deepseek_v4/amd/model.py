@@ -55,6 +55,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
@@ -538,6 +539,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # The forward packs its aux taps into the PP handoff, so an EAGLE3-style
+    # drafter on the last rank still sees taps from earlier stages.
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -570,7 +575,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             device=self.device,
         )
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+            # A DSpark drafter on the last rank aliases this embedding, so that
+            # rank needs a real one rather than the placeholder.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -718,7 +725,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            # The drafter lives on the last rank, so taps produced here ride the
+            # handoff keyed by their global slot.
+            return IntermediateTensors(
+                {"hidden_states": hidden_states}
+                | self.pack_local_aux_for_last(aux_hidden_states)
+            )
 
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
@@ -733,6 +745,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        # Upstream taps come first: slots are numbered by producing rank, so
+        # prepending them keeps the drafter's tap order global, not per stage.
+        aux_hidden_states = (
+            self.recv_remote_aux_from_producers(intermediate_tensors)
+            + aux_hidden_states
+        )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

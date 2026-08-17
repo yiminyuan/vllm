@@ -290,6 +290,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # This draft shares the target's full vocabulary, so probabilistic drafting
+    # has no reduced draft->target column map to apply.
+    draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

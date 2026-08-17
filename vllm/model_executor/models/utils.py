@@ -795,6 +795,32 @@ class PPMissingLayer(torch.nn.Identity):
         return args[0] if args else next(iter(kwargs.values()))
 
 
+def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
+    """Whether the last PP rank must instantiate the target's ``embed_tokens``.
+
+    These drafters run on the last rank and alias the target's input embedding
+    when their own checkpoint ships none, which is the norm for DSpark. The
+    target's embedding otherwise lives on the first rank only, so the alias would
+    bind a PPMissingLayer and the drafter would embed uninitialized weights.
+
+    Which draft checkpoints ship their own is unknown until the draft weights
+    load, i.e. after the target is built, so provision it for every method that
+    might need one and accept a duplicate when it turns out not to.
+    """
+    from vllm.distributed.parallel_state import get_pp_group
+
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method not in (
+        "eagle",
+        "eagle3",
+        "dflash",
+        "dspark",
+    ):
+        return False
+    pp = get_pp_group()
+    return pp.world_size > 1 and pp.is_last_rank
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,

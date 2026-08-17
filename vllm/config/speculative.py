@@ -1258,7 +1258,11 @@ class SpeculativeConfig:
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            # The drafter is built on the last pipeline stage only, so it never
+            # spans stages and must not inherit the target's pipeline size --
+            # doing so makes verify_with_parallel_config reject every draft
+            # model that does not implement SupportsPP, which is all of them.
+            pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
