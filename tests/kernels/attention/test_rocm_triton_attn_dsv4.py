@@ -445,23 +445,17 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
 
 
 def _ref_paged_mqa_logits(
-    q, kv_cache, weights, context_lens, block_tables, max_model_len
+    q, vals, scales, weights, context_lens, block_tables, max_model_len
 ):
-    """Readable reference following the layout the cache writer produces."""
+    """Readable reference over the cache's logical contents.
+
+    Takes the values and scales the writer stored rather than re-parsing the
+    packed bytes, so it cannot inherit the layout the kernel reads with. A
+    reference that unpacks the cache the same way the kernel does agrees with it
+    whether or not either matches the writer.
+    """
     batch, next_n, _, head_dim = q.shape
-    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
-    flat = kv_cache.reshape(num_blocks, -1)
-    vals = (
-        flat[:, : block_size * head_dim]
-        .view(torch.float8_e4m3fn)
-        .float()
-        .reshape(num_blocks, block_size, head_dim)
-    )
-    scales = (
-        flat[:, block_size * head_dim :]
-        .view(torch.float32)
-        .reshape(num_blocks, block_size)
-    )
+    block_size = vals.shape[1]
 
     lens = context_lens.reshape(batch, -1)
     out = torch.full((batch * next_n, max_model_len), float("-inf"), device=q.device)
@@ -484,17 +478,40 @@ def _ref_paged_mqa_logits(
 
 
 def _build_indexer_cache(num_blocks, block_size, head_dim, device):
-    """Blocks of ``block_size`` fp8 rows followed by one fp32 scale per row."""
-    vals = (torch.randn(num_blocks, block_size, head_dim, device=device) * 2).to(
-        torch.float8_e4m3fn
+    """An indexer cache filled by the production writer.
+
+    Assembling the bytes here by hand bakes this file's layout assumption into
+    the kernel *and* its reference: they then agree with each other while both
+    disagree with whatever actually writes the cache, which is how a
+    writer/reader layout mismatch stays invisible. Returns the cache plus the
+    logical values it holds, so references never re-parse the bytes.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        indexer_k_quant_and_cache_triton,
     )
-    scales = torch.rand(num_blocks, block_size, device=device) + 0.5
-    flat = torch.empty(
+
+    fp8 = current_platform.fp8_dtype()
+    fp8_max = 224.0 if current_platform.is_fp8_fnuz() else 448.0
+    n = num_blocks * block_size
+    k = torch.randn(n, head_dim, dtype=torch.float16, device=device) * 2
+
+    cache = torch.zeros(
         num_blocks, block_size * (head_dim + 4), dtype=torch.uint8, device=device
     )
-    flat[:, : block_size * head_dim] = vals.view(torch.uint8).reshape(num_blocks, -1)
-    flat[:, block_size * head_dim :] = scales.view(torch.uint8).reshape(num_blocks, -1)
-    return flat.view(num_blocks, block_size, 1, head_dim + 4)
+    slot = torch.arange(n, dtype=torch.int64, device=device)
+    indexer_k_quant_and_cache_triton(
+        k, cache.view(num_blocks, block_size, -1), slot, 128, "ue8m0"
+    )
+
+    # Mirrors only the writer's quantisation rule, never its addressing.
+    amax = k.abs().amax(dim=-1).to(torch.float32).clamp(min=1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(amax / fp8_max)))
+    vals = (k.float() / scales[:, None]).clamp(-fp8_max, fp8_max).to(fp8).float()
+    return (
+        cache.view(num_blocks, block_size, 1, head_dim + 4),
+        vals.reshape(num_blocks, block_size, head_dim),
+        scales.reshape(num_blocks, block_size),
+    )
 
 
 @torch.inference_mode()
@@ -521,7 +538,9 @@ def test_paged_mqa_logits_triton_matches_reference(
     max_model_len = 512
     max_blocks = max_model_len // block_size
 
-    kv_cache = _build_indexer_cache(num_blocks, block_size, head_dim, device)
+    kv_cache, cache_vals, cache_scales = _build_indexer_cache(
+        num_blocks, block_size, head_dim, device
+    )
     q = (torch.randn(batch, next_n, heads, head_dim, device=device) * 0.5).to(
         torch.float8_e4m3fn
     )
@@ -538,7 +557,8 @@ def test_paged_mqa_logits_triton_matches_reference(
     )
 
     expected = _ref_paged_mqa_logits(
-        q, kv_cache, weights, context_lens, block_tables, max_model_len
+        q, cache_vals, cache_scales, weights, context_lens, block_tables,
+        max_model_len,
     )
     out = torch.empty_like(expected)
     actual = paged_mqa_logits_triton(
@@ -1595,7 +1615,9 @@ def test_paged_mqa_logits_matches_reference_at_production_shapes(next_n: int) ->
     max_blocks = max_model_len // block_size
     num_blocks = max_blocks * batch
 
-    kv_cache = _build_indexer_cache(num_blocks, block_size, head_dim, device)
+    kv_cache, cache_vals, cache_scales = _build_indexer_cache(
+        num_blocks, block_size, head_dim, device
+    )
     q = (torch.randn(batch, next_n, heads, head_dim, device=device) * 0.5).to(
         torch.float8_e4m3fn
     )
@@ -1606,7 +1628,7 @@ def test_paged_mqa_logits_matches_reference_at_production_shapes(next_n: int) ->
     lens = torch.tensor([2560, 6000, 9000], dtype=torch.int32, device=device)
 
     expected = _ref_paged_mqa_logits(
-        q, kv_cache, weights, lens, block_tables, max_model_len
+        q, cache_vals, cache_scales, weights, lens, block_tables, max_model_len
     )
     out = torch.empty_like(expected)
     actual = paged_mqa_logits_triton(
@@ -1776,3 +1798,117 @@ def test_canonicalise_topk_order_sorts_and_keeps_padding_last() -> None:
     valid = buf[0][buf[0] >= 0]
     assert torch.equal(valid, valid.sort().values), "valid indices not ascending"
     assert torch.all(buf[0][valid.numel():] == -1), "padding must sort last"
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("context,next_n", [(1200, 1), (4800, 6), (9600, 6)])
+def test_paged_mqa_logits_at_production_block_size_and_context(
+    context: int, next_n: int
+) -> None:
+    """The decode logits must hold at the block size and lengths actually served.
+
+    The other test for this kernel runs at max_model_len 512, block_size 64 and
+    contexts of at most 300 tokens. Deployment uses --block-size 256 and
+    prompts of tens of thousands of tokens, and the indexer turns these logits
+    into a top-k: a small drift here does not fail, it silently reorders the
+    selection and drops content the answer needed. next_n 6 is the shape
+    DSpark's 1 + 5 speculative tokens produce.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import paged_mqa_logits_triton
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, heads, head_dim, block_size = 2, 64, 128, 256
+    max_blocks = -(-context // block_size)
+    max_model_len = max_blocks * block_size
+    num_blocks = max_blocks + 2
+
+    kv_cache, cache_vals, cache_scales = _build_indexer_cache(
+        num_blocks, block_size, head_dim, device
+    )
+    q = (torch.randn(batch, next_n, heads, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.rand(batch * next_n, heads, device=device, dtype=torch.float32)
+    block_tables = (
+        torch.arange(max_blocks, dtype=torch.int32, device=device).repeat(batch, 1)
+        % num_blocks
+    )
+    context_lens = torch.tensor(
+        [context, context - 37], dtype=torch.int32, device=device
+    )
+
+    expected = _ref_paged_mqa_logits(
+        q, cache_vals, cache_scales, weights, context_lens, block_tables,
+        max_model_len,
+    )
+    out = torch.empty_like(expected)
+    actual = paged_mqa_logits_triton(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len, out
+    )
+
+    assert torch.equal(torch.isinf(actual), torch.isinf(expected)), (
+        "masked region differs"
+    )
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=2e-2, rtol=2e-3)
+
+    # The selection is what the model consumes, so assert it directly.
+    for row in range(actual.shape[0]):
+        valid = int((~torch.isinf(expected[row])).sum())
+        k = min(512, valid)
+        want = set(expected[row].topk(k).indices.tolist())
+        got = set(actual[row].topk(k).indices.tolist())
+        assert want == got, f"row {row}: top-{k} selection differs"
+
+
+def _ref_mqa_logits(q, k_fp8, k_scale, weights, ks, ke):
+    """Readable reference for the ragged prefill indexer logits."""
+    m, n = q.shape[0], k_fp8.shape[0]
+    out = torch.empty(m, n, dtype=torch.float32, device=q.device)
+    kf = k_fp8.float()
+    for i in range(m):
+        score = torch.relu(kf @ q[i].float().T)
+        out[i] = (score * weights[i]).sum(-1) * k_scale
+    cols = torch.arange(n, device=q.device)[None, :]
+    valid = (cols >= ks[:, None]) & (cols < ke[:, None])
+    return torch.where(valid, out, torch.full_like(out, float("-inf")))
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_keys", [256, 4800, 9600])
+def test_mqa_logits_prefill_matches_reference(num_keys: int) -> None:
+    """The prefill indexer logits had no test at all.
+
+    This kernel scores every prefill chunk, so an error here misranks the
+    candidates each prompt token attends to -- corrupting the prompt's own
+    representations at write time, where no later step can recover them.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_mqa_logits
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    heads, head_dim = 64, 128
+    m = min(512, num_keys)
+
+    q = (torch.randn(m, heads, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    k = (torch.randn(num_keys, head_dim, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    k_scale = torch.rand(num_keys, device=device, dtype=torch.float32) * 0.02 + 0.01
+    weights = torch.rand(m, heads, device=device, dtype=torch.float32)
+    ks = torch.zeros(m, dtype=torch.int32, device=device)
+    ke = (
+        torch.arange(m, device=device, dtype=torch.int32) + (num_keys - m) + 1
+    ).contiguous()
+
+    actual = rocm_fp8_mqa_logits(q, (k, k_scale), weights, ks, ke)
+    expected = _ref_mqa_logits(q, k, k_scale, weights, ks, ke)
+
+    assert torch.equal(torch.isinf(actual), torch.isinf(expected)), (
+        "masked region differs"
+    )
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=2e-2, rtol=2e-3)

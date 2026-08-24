@@ -27,6 +27,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.common import (
+    indexer_k_cache_is_shuffled,
     quant_fp8_to_uint8,
     use_fp8_bitops_decode,
 )
@@ -83,6 +84,9 @@ def compress_norm_rope_store_triton(
         # Indexer FP8 path: keeps the FP8 encoder selector, takes no NaN sanitiser.
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
+        # This cache is read back by the indexer gather, which tiles a block's
+        # values once the block holds more than one token. Match it.
+        kernel_kwargs["K_SHUFFLE"] = indexer_k_cache_is_shuffled(kv_cache.shape[1])
 
     kernel[(num_actual,)](
         # state cache
@@ -717,6 +721,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
     FP8_BITOPS: tl.constexpr = False,
+    K_SHUFFLE: tl.constexpr = False,
+    BLOCK_TILE_SIZE: tl.constexpr = 16,
+    HEAD_TILE_SIZE: tl.constexpr = 16,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -799,7 +806,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
-    fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    # The reader tiles the value half of a block whenever block_size > 1
+    # (cp_gather_indexer_k_quant_cache_triton selects SHUFFLE there), so the
+    # store must use the same addressing. Writing flat into a cache that is read
+    # tiled scrambles the K vectors and silently corrupts retrieval.
+    if K_SHUFFLE:
+        fp8_ptr = (
+            cache_block_ptr
+            + (kv_pos_in_block // BLOCK_TILE_SIZE) * BLOCK_TILE_SIZE * TOKEN_STRIDE
+            + (kv_pos_in_block % BLOCK_TILE_SIZE) * HEAD_TILE_SIZE
+        )
+    else:
+        fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
     scale_ptr = (
         cache_block_ptr
         + kv_cache_block_size * TOKEN_STRIDE
@@ -848,7 +866,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     x_uint8 = quant_fp8_to_uint8(x_clamped, False, FP8_BITOPS)
 
-    tl.store(fp8_ptr + block, x_uint8, mask=mask)
+    # Scales stay flat in both layouts; only the values are tiled.
+    if K_SHUFFLE:
+        store_off = (block // HEAD_TILE_SIZE) * HEAD_TILE_SIZE * BLOCK_TILE_SIZE + (
+            block % HEAD_TILE_SIZE
+        )
+    else:
+        store_off = block
+    tl.store(fp8_ptr + store_off, x_uint8, mask=mask)
 
     # Single float32 scale
     scale_val = tl.exp2(exponent)

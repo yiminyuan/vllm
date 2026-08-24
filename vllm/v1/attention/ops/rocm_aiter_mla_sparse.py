@@ -17,6 +17,7 @@ from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import (
     dequant_fp8_ue8m0,
+    indexer_k_cache_is_shuffled,
     pack_seq_triton,
     quant_fp8_to_uint8,
     unpack_seq_triton,
@@ -122,7 +123,7 @@ def indexer_k_quant_and_cache_triton(
     kv_cache_value = kv_cache[:, : block_size * head_dim].view(fp8_dtype)
     kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
     head_tile_size = head_tile_size // kv_cache.element_size()
-    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    layout = "SHUFFLE" if indexer_k_cache_is_shuffled(block_size) else "NORMAL"
     grid = (num_tokens,)
     _indexer_k_quant_and_cache_kernel[grid](
         k,
@@ -329,7 +330,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
-    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    layout = "SHUFFLE" if indexer_k_cache_is_shuffled(block_size) else "NORMAL"
     kernel_args = (
         k_cache_value,
         k_cache_scale,
@@ -625,6 +626,32 @@ def rocm_fp8_paged_mqa_logits(
 
 
 @triton.jit
+def _indexer_value_offset(
+    tok,
+    dim,
+    HEAD_DIM: tl.constexpr,
+    K_SHUFFLE: tl.constexpr,
+    BLOCK_TILE_SIZE: tl.constexpr,
+    HEAD_TILE_SIZE: tl.constexpr,
+):
+    """Byte offset of one indexer-cache value within its block.
+
+    Three kernels touch this cache -- the compressor and
+    indexer_k_quant_and_cache write it, the gather and the paged logits read it
+    -- so the addressing lives in one place. They disagreed before: the cache
+    was written flat and gathered tiled, which scrambled K on the prefill path.
+    """
+    if K_SHUFFLE:
+        return (
+            (tok // BLOCK_TILE_SIZE) * BLOCK_TILE_SIZE * HEAD_DIM
+            + (tok % BLOCK_TILE_SIZE) * HEAD_TILE_SIZE
+            + (dim // HEAD_TILE_SIZE) * HEAD_TILE_SIZE * BLOCK_TILE_SIZE
+            + dim % HEAD_TILE_SIZE
+        )
+    return tok * HEAD_DIM + dim
+
+
+@triton.jit
 def _paged_mqa_logits_kernel(
     q_ptr,  # [num_tokens, heads, head_dim] fp8 bytes
     kv_cache_ptr,  # [num_blocks, block_size * (head_dim + 4)] bytes
@@ -644,6 +671,9 @@ def _paged_mqa_logits_kernel(
     HEAD_DIM: tl.constexpr,
     IS_FNUZ: tl.constexpr,
     FP8_BITOPS: tl.constexpr,
+    K_SHUFFLE: tl.constexpr = False,
+    BLOCK_TILE_SIZE: tl.constexpr = 16,
+    HEAD_TILE_SIZE: tl.constexpr = 16,
 ):
     token = tl.program_id(0)
     blk = tl.program_id(1)
@@ -680,7 +710,14 @@ def _paged_mqa_logits_kernel(
     block_base = block_id.to(tl.int64) * kv_block_stride
     k = widen_fp8(
         tl.load(
-            kv_cache_ptr + block_base + offs_t[:, None] * HEAD_DIM + offs_d[None, :],
+            kv_cache_ptr + block_base + _indexer_value_offset(
+                offs_t[:, None],
+                offs_d[None, :],
+                HEAD_DIM,
+                K_SHUFFLE,
+                BLOCK_TILE_SIZE,
+                HEAD_TILE_SIZE,
+            ),
             mask=valid[:, None],
             other=0,
         ),
@@ -762,6 +799,7 @@ def paged_mqa_logits_triton(
         HEAD_DIM=head_dim,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         FP8_BITOPS=use_fp8_bitops_decode(),
+        K_SHUFFLE=indexer_k_cache_is_shuffled(block_size),
     )
     return out
 

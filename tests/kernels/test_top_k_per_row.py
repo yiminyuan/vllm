@@ -10,12 +10,21 @@ from vllm.utils.torch_utils import set_random_seed
 
 # Test parameters
 NUM_ROWS = [1, 32, 2050]
-TOP_K_VALUES = [2048, 3000]
+TOP_K_VALUES = [512, 2048, 3000]
 BATCH_SIZE = [1, 2, 2048]
 NEXT_N = [1, 8]
 DATA_GENERATION = ["random", "10LSBits"]
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+
+# top_k_per_row_{prefill,decode} back the DeepSeek-V4 sparse indexer on every
+# accelerator that builds _C, ROCm included. The workspace backends below
+# (persistent_topk / cooperative_topk) are CUDA-only: topk.cu raises
+# "persistent_topk is not supported on ROCm".
+requires_top_k_per_row = pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_rocm()),
+    reason="top_k_per_row requires CUDA or ROCm",
+)
 
 def _has_device_capability(major: int) -> bool:
     return current_platform.is_cuda() and current_platform.has_device_capability(major)
@@ -222,7 +231,7 @@ def validate_topk_against_reference(
 @pytest.mark.parametrize("num_rows", NUM_ROWS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("clean_logits", [True, False])
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@requires_top_k_per_row
 @torch.inference_mode()
 def test_top_k_per_row(
     num_rows: int,
@@ -337,7 +346,7 @@ def _run_top_k_per_row_decode_test(
 @pytest.mark.parametrize("next_n", NEXT_N)
 @pytest.mark.parametrize("clean_logits", [True, False])
 @pytest.mark.parametrize("data_generation", DATA_GENERATION)
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@requires_top_k_per_row
 @torch.inference_mode()
 def test_top_k_per_row_decode(
     top_k: int,
@@ -356,7 +365,7 @@ def test_top_k_per_row_decode(
     )
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@requires_top_k_per_row
 @pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_top_k_per_row_decode_large_vocab_size(clean_logits: bool) -> None:

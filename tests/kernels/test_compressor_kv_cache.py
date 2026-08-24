@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.attention.ops.common import indexer_k_cache_is_shuffled
+
 from vllm import _custom_ops as ops
 from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
@@ -511,6 +513,22 @@ def test_dequantize_and_gather_k_cache(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def _read_indexer_value(kv_cache, blk, pos, block_size, token_stride, shuffled):
+    """One token's value bytes out of an indexer cache block.
+
+    Mirrors the addressing the gather uses, so the expectation follows the
+    layout contract instead of hard-coding one writer's byte offsets.
+    """
+    if not shuffled:
+        off = pos * token_stride
+        return kv_cache[blk, off : off + token_stride]
+    bt = ht = 16
+    base = (pos // bt) * bt * token_stride + (pos % bt) * ht
+    idx = torch.arange(token_stride, device=kv_cache.device)
+    off = base + (idx // ht) * ht * bt + idx % ht
+    return kv_cache[blk][off]
+
+
 # ── Test C: Indexer path ────────────────────────────────────────────────────
 
 
@@ -887,6 +905,10 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         device=device,
     )
 
+    # The fp8 indexer cache is stored tiled wherever the gather reads it tiled;
+    # the MXFP4 kernel has no tiled path, so it always stores flat.
+    shuffled = (not use_fp4) and indexer_k_cache_is_shuffled(kv_block_size)
+
     kernel[(num_tokens,)](
         state_cache,
         state_cache.stride(0),
@@ -916,6 +938,8 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         num_warps=1,
+        # The MXFP4 kernel has no tiled store, so it takes no layout selector.
+        **({} if use_fp4 else {"K_SHUFFLE": shuffled}),
     )
 
     k_quant, scale = _reference_kv_compress_norm_rope(
@@ -934,8 +958,9 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
     if use_fp4:
         for i in range(num_tokens):
             blk, pos = i // kv_block_size, i % kv_block_size
-            val_off = pos * TOKEN_STRIDE
-            fp4_actual = kv_cache[blk, val_off : val_off + TOKEN_STRIDE]
+            fp4_actual = _read_indexer_value(
+                kv_cache, blk, pos, kv_block_size, TOKEN_STRIDE, shuffled
+            )
             assert torch.equal(k_quant[i], fp4_actual), (
                 f"token {i}: packed nibbles differ, "
                 f"{(k_quant[i] != fp4_actual).sum()} "
@@ -947,6 +972,39 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
             assert torch.equal(scale_actual, scale[i]), (
                 f"token {i}: ue8m0 {scale_actual.tolist()} != {scale[i].tolist()}"
             )
+
+    # The seam that actually ships: production sets skip_k_cache_insert=True, so
+    # this kernel -- not indexer_k_quant_and_cache -- writes the cache the
+    # indexer gather reads back. A layout disagreement between the two scrambles
+    # K silently rather than failing, so assert the round trip, not byte offsets.
+    if not use_fp4 and current_platform.is_rocm():
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            cp_gather_indexer_k_quant_cache_triton,
+        )
+
+        fp8_dtype = current_platform.fp8_dtype()
+        k_fp8 = torch.empty((num_tokens, HEAD_DIM), dtype=fp8_dtype, device=device)
+        k_scale = torch.empty((num_tokens, 4), dtype=torch.uint8, device=device)
+        block_table = torch.arange(
+            kv_n_blocks, dtype=torch.int32, device=device
+        ).reshape(1, -1)
+        cu_seq_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        token_to_seq = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        cp_gather_indexer_k_quant_cache_triton(
+            kv_cache.view(kv_n_blocks, kv_block_size, -1),
+            k_fp8,
+            k_scale,
+            block_table,
+            cu_seq_lens,
+            token_to_seq,
+        )
+        got = k_fp8.to(torch.float32) * k_scale.view(torch.float32).reshape(
+            num_tokens, 1
+        )
+        want = k_quant.view(fp8_dtype).to(torch.float32) * scale.view(
+            torch.float32
+        ).reshape(num_tokens, 1)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     else:
         k_quant = k_quant.view(torch.uint8)
