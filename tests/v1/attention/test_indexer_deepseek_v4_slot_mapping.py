@@ -116,3 +116,43 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+def test_prefill_chunks_fit_the_compressed_gather_workspace():
+    """Chunks must fit the workspace the indexer actually allocates.
+
+    The chunker is handed *compressed* sequence lengths, while
+    get_max_prefill_buffer_size() counts uncompressed entries and the indexer
+    allocates its gather workspace as that value // compress_ratio. Budgeting
+    compressed lengths against the uncompressed number admits chunks
+    compress_ratio times larger than the buffer holds; `k_fp8_full[:n]` then
+    clamps rather than raising, so the gather leaves tail rows unwritten and the
+    logits read whatever the workspace held before -- silent corruption. Upstream
+    reports the same unit mismatch in #51252.
+    """
+    from vllm.v1.attention.backends.mla.indexer import (
+        get_max_prefill_buffer_size,
+        split_indexer_prefill_chunks,
+    )
+
+    compress_ratio = 4
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32768),
+    )
+    workspace = get_max_prefill_buffer_size(config) // compress_ratio
+
+    # Enough requests that the greedy packer must cut somewhere.
+    per_req = workspace // 3
+    compressed_seq_lens = torch.full((8,), per_req, dtype=torch.int32)
+    query_lens = torch.full((8,), 64, dtype=torch.int32)
+
+    chunks = split_indexer_prefill_chunks(
+        compressed_seq_lens, query_lens, workspace, 1 << 34
+    )
+    assert chunks, "expected at least one chunk"
+    for req_slice, _ in chunks:
+        total = int(compressed_seq_lens[req_slice].sum())
+        assert total <= workspace, (
+            f"chunk of {total} compressed entries exceeds the {workspace}-entry "
+            "gather workspace"
+        )
