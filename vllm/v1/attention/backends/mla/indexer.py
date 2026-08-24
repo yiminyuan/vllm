@@ -892,10 +892,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            # The lengths handed to the chunker are compressed, so the budget
+            # has to be too: the consumer sizes its gather workspace as
+            # get_max_prefill_buffer_size() // compress_ratio. Comparing
+            # compressed lengths against the uncompressed budget lets through
+            # chunks compress_ratio times larger than the buffer holds, and
+            # `k_fp8_full[:total_seq_lens]` then clamps instead of raising, so
+            # the gather leaves tail rows unwritten and the logits read whatever
+            # the workspace held before. Same fix as upstream #51252.
             chunk_specs = split_indexer_prefill_chunks(
                 compressed_seq_lens_cpu[num_decodes:],
                 prefill_query_lens_cpu,
-                self.max_prefill_buffer_size,
+                self.max_prefill_buffer_size // self.compress_ratio,
                 max_logits_bytes,
                 request_offset=num_decodes,
             )
