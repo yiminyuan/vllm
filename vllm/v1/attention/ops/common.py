@@ -27,6 +27,31 @@ def use_fp8_bitops_decode() -> bool:
     return on_gfx1030()
 
 
+def indexer_k_cache_is_shuffled(block_size: int) -> bool:
+    """Whether the indexer K cache stores its values tiled rather than flat.
+
+    The ROCm gather tiles the value half of a block once a block holds more than
+    one token, so every writer of that cache has to store it the same way. This
+    is the one definition of the rule: a writer and a reader disagreeing here
+    scrambles the K vectors and silently corrupts long-context retrieval rather
+    than failing.
+
+    The tiled layout exists for AITER's preshuffled sparse indexing. gfx1030 has
+    no AITER: its writer is the DeepSeek-V4 compressor and its readers are the
+    Triton gather and paged-logits kernels, all of which address the cache flat.
+    Tiling only the gather there scrambled K on the prefill path while decode
+    still read it flat, so the two readers disagreed with each other.
+    """
+    from vllm.platforms import current_platform
+    from vllm.platforms.rocm import on_gfx1030
+
+    if not current_platform.is_rocm():
+        return False
+    if on_gfx1030():
+        return False
+    return block_size > 1
+
+
 @triton.jit
 def dequant_fp8_ue8m0(
     x_uint8,
